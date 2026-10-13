@@ -37,10 +37,14 @@ The credentials file is excluded by `.gitignore`. You can instead set `CUDY_ROUT
 ## Run
 
 ```powershell
-python main_settings_only_fixed2.py
+python cudy_auto_refill.py
 ```
 
 The program only starts monitoring after you press Start in the GUI. It can send SMS replies and delete SMS during cleanup, so review the router address and cleanup thresholds before starting it.
+
+## Working copy
+
+`main_settings_only_fixed2.py` is the original user-supplied version and remains unchanged because it may be running in the background. Continue development in `cudy_auto_refill.py`, which starts as an identical copy. Do not run it alongside the original; both versions can process the same router inbox and share `sms_state.json`.
 
 ## Local data
 
@@ -53,4 +57,4 @@ The program only starts monitoring after you press Start in the GUI. It can send
 - The manual test-refill button is a placeholder.
 - Polling and watchdog settings apply at runtime and are not persisted between launches.
 
-This repository starts from the selected working-file baseline. The prior working behavior was reported by the project owner; the current version has not been live-tested as part of this repository setup.
+The original version's working behavior was reported by the project owner. The new working copy has not been live-tested yet.
