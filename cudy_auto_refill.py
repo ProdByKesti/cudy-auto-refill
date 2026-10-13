@@ -320,10 +320,19 @@ def login():
             timeout=REQUEST_TIMEOUT
         )
 
-        if login_response.status_code == 302:
-            print(
-                "🟢 LOGIN ERFOLGREICH!"
-            )
+        # Cudy-Firmware kann nach erfolgreichem Login direkt HTTP 200 statt
+        # eines Redirects liefern. Entscheidend ist, ob eine geschützte Seite
+        # ohne erneutes Login-Formular erreichbar ist.
+        sms_page = session.get(
+            f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms?iface=4g",
+            timeout=REQUEST_TIMEOUT
+        )
+        login_form = BeautifulSoup(sms_page.text, "html.parser").find(
+            "input", {"name": "luci_password"}
+        )
+
+        if sms_page.status_code == 200 and not login_form:
+            print("🟢 LOGIN ERFOLGREICH! (geschützte Router-Seite bestätigt)")
 
             gui_status(
                 "router",
@@ -337,9 +346,13 @@ def login():
 
             return True
 
+        grund = (
+            "Router zeigt weiterhin das Login-Formular"
+            if login_form
+            else f"geschützte Seite antwortet mit HTTP {sms_page.status_code}"
+        )
         print(
-            "🔴 LOGIN FEHLGESCHLAGEN:",
-            login_response.status_code
+            f"🔴 LOGIN FEHLGESCHLAGEN: POST HTTP {login_response.status_code}; {grund}."
         )
 
         gui_status(
@@ -4150,7 +4163,10 @@ class CudyGUI:
                         else:
                             fenster.destroy()
                             self.signal_aktualisieren()
-                            print("✅ LTE-Bandwahl wurde an den Router übermittelt.")
+                            print(
+                                "✅ LTE-Bandwahl wurde gespeichert und vom Router "
+                                "zurückbestätigt. Die LTE-Verbindung baut sich neu auf."
+                            )
                     except tk.TclError:
                         pass
 

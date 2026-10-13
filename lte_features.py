@@ -10,6 +10,7 @@ CONFIG_PATH = "/cgi-bin/luci/admin/network/gcom/config/apn?embedded=&iface=4g"
 DOWNLOAD_URL = "https://speed.cloudflare.com/__down"
 DOWNLOAD_BYTES = 4_000_000
 RECONNECT_SECONDS = 45
+BAND_VERIFY_SECONDS = 30
 
 
 def _form(session, base_url, ensure_session):
@@ -112,7 +113,29 @@ def apply_band_config(session, base_url, ensure_session, automatic, bands):
     if result.status_code == 403:
         raise PermissionError("Router-Session beim Speichern abgelaufen.")
     result.raise_for_status()
-    return True
+
+    # HTTP 200 bestätigt nur die Anfrage. Cudy übernimmt die neue Auswahl
+    # separat; deshalb lesen wir die geschützte Konfigurationsseite zurück.
+    expected_bands = set(selected)
+    deadline = time.monotonic() + BAND_VERIFY_SECONDS
+    last_error = None
+    while True:
+        try:
+            current = read_band_config(session, base_url, ensure_session)
+            if current["automatic"] == bool(automatic) and (
+                automatic or set(current["selected"]) == expected_bands
+            ):
+                return True
+            last_error = "Router zeigt noch die vorherige Bandwahl."
+        except Exception as exc:
+            last_error = str(exc)
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Speichern wurde gesendet, aber die Bandwahl ließ sich nicht "
+                f"bestätigen: {last_error}"
+            )
+        time.sleep(1.5)
 
 
 def _cancelled(event):
