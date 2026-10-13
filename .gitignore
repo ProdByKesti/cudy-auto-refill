@@ -5,9 +5,11 @@ venv/
 .env
 .env.*
 cudy_credentials.json
-sms_state.json
-sms_state.json.tmp
+*.dpapi*
+settings.json
+sms_state.json*
 *.log
+*.log.*
 .vscode/
 
 # This folder contains several downloaded variants; publish only the selected baseline.

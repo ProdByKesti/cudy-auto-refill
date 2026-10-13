@@ -4,15 +4,20 @@ import time
 import json
 import os
 import sys
+import ctypes
+import shutil
 import threading
 import queue
+import logging
+import re
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from tkinter import ttk, messagebox
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from lte_features import (
     LTE_BANDS,
-    apply_band_config,
+    apply_band_config_with_fallback,
     read_band_config,
     run_all_band_speedtest,
 )
@@ -22,47 +27,160 @@ from lte_features import (
 # ============================================================
 
 BASE_URL = "http://192.168.10.1"
-
-# Router credentials stay in a local, ignored file or environment variable.
-CREDENTIALS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "cudy_credentials.json"
+APP_HOME_DIR = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(os.path.abspath(__file__))
 )
+APP_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "CudyAutoRefill",
+)
+CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "router_password.dpapi")
+LEGACY_CREDENTIAL_FILES = (
+    os.path.join(APP_DATA_DIR, "cudy_credentials.json"),
+    os.path.join(APP_HOME_DIR, "cudy_credentials.json"),
+)
+SMS_STATE_FILE = os.path.join(APP_DATA_DIR, "sms_state.json")
+LEGACY_SMS_STATE_FILE = os.path.join(APP_HOME_DIR, "sms_state.json")
+LTE_PROFILE_FILE = os.path.join(APP_DATA_DIR, "lte_profile.json")
+APP_LOG_FILE = os.path.join(APP_DATA_DIR, "cudy_auto_refill.log")
+SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
+MAX_GUI_LOG_LINES = 3000
+
+
+def lade_app_einstellungen():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+APP_SETTINGS = lade_app_einstellungen()
+_saved_router_url = APP_SETTINGS.get("router_url")
+if isinstance(_saved_router_url, str) and _saved_router_url.startswith(("http://", "https://")):
+    BASE_URL = _saved_router_url.rstrip("/")
+
+
+def _setting_int(name, default, minimum, maximum):
+    try:
+        value = int(APP_SETTINGS.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def speichere_app_einstellungen(value):
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        temporary = SETTINGS_FILE + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, SETTINGS_FILE)
+        return True
+    except OSError as exc:
+        print("⚠️ Einstellungen konnten nicht gespeichert werden:", exc)
+        return False
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", ctypes.c_ulong),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+def _dpapi_transform(data, protect):
+    if os.name != "nt":
+        raise OSError("Windows DPAPI ist auf diesem System nicht verfügbar.")
+    raw = bytes(data)
+    buffer = ctypes.create_string_buffer(raw, len(raw))
+    input_blob = _DataBlob(
+        len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.WinDLL("Crypt32.dll", use_last_error=True)
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    if protect:
+        function = crypt32.CryptProtectData
+        function.argtypes = [
+            ctypes.POINTER(_DataBlob), ctypes.c_wchar_p,
+            ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.POINTER(_DataBlob),
+        ]
+    else:
+        function = crypt32.CryptUnprotectData
+        function.argtypes = [
+            ctypes.POINTER(_DataBlob), ctypes.POINTER(ctypes.c_wchar_p),
+            ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.POINTER(_DataBlob),
+        ]
+    function.restype = ctypes.c_bool
+    if not function(
+        ctypes.byref(input_blob), None, None, None, None, 0,
+        ctypes.byref(output_blob),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(output_blob.pbData, output_blob.cbData)
+    finally:
+        if output_blob.pbData:
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            kernel32.LocalFree(output_blob.pbData)
+
+
+def speichere_router_passwort(passwort):
+    encrypted = _dpapi_transform(passwort.encode("utf-8"), protect=True)
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    temporary = CREDENTIALS_FILE + ".tmp"
+    with open(temporary, "wb") as f:
+        f.write(encrypted)
+    os.replace(temporary, CREDENTIALS_FILE)
 
 
 def lade_router_passwort():
     passwort = os.environ.get("CUDY_ROUTER_PASSWORD")
-
     if passwort:
         return passwort
 
     try:
-        with open(
-            CREDENTIALS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            daten = json.load(f)
+        with open(CREDENTIALS_FILE, "rb") as f:
+            encrypted = f.read()
+        return _dpapi_transform(encrypted, protect=False).decode("utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, UnicodeDecodeError):
+        print("⚠️ Geschütztes Router-Passwort konnte nicht gelesen werden.")
 
-        if isinstance(daten, dict):
-            passwort = daten.get("router_password", "")
-            return passwort if isinstance(passwort, str) else ""
-
-    except (OSError, json.JSONDecodeError):
-        return ""
-
+    for path in LEGACY_CREDENTIAL_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        passwort = data.get("router_password", "")
+        if not isinstance(passwort, str) or not passwort:
+            continue
+        if os.name == "nt":
+            try:
+                speichere_router_passwort(passwort)
+                print(
+                    "🔐 Router-Passwort in Windows DPAPI übernommen. "
+                    "Die alte JSON-Datei bleibt zur manuellen Entfernung erhalten."
+                )
+            except (OSError, ValueError):
+                print("⚠️ Router-Passwort konnte nicht mit Windows DPAPI geschützt werden.")
+        return passwort
     return ""
 
 
-PASSWORT = lade_router_passwort()
-
-SMS_STATE_FILE = "sms_state.json"
-
-APP_DATA_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "CudyAutoRefill"
-)
-LTE_PROFILE_FILE = os.path.join(APP_DATA_DIR, "lte_profile.json")
+# The password is loaded lazily when the first router login is attempted.
+PASSWORT = ""
 
 def lade_lte_profil():
     try:
@@ -85,17 +203,21 @@ def speichere_lte_profil(value):
 
 
 # Polling
-POLL_INTERVAL = 10
+POLL_INTERVAL = _setting_int("poll_interval", 10, 1, 3600)
 
 # Regelmäßiger Session-Refresh
-SESSION_REFRESH_INTERVAL = 5 * 60
+SESSION_REFRESH_INTERVAL = _setting_int("session_refresh_interval", 300, 0, 86400)
 
 # Netzwerk-Timeout
 REQUEST_TIMEOUT = 10
 
 # Watchdog
 MAX_POLL_FEHLER = 3
-WATCHDOG_TIMEOUT = 45
+WATCHDOG_TIMEOUT = _setting_int("watchdog_timeout", 45, 0, 86400)
+LOGIN_RETRY_BASE_SECONDS = 10
+LOGIN_RETRY_MAX_SECONDS = 120
+SESSION_RECOVERY_BASE_SECONDS = 10
+SESSION_RECOVERY_MAX_SECONDS = 120
 
 # Lidl Connect
 LIDL_ABSENDER = "80808"
@@ -147,28 +269,71 @@ status_data = {
 }
 
 
+def redact_log_line(text):
+    """Remove credential-like values and SMS bodies before writing diagnostics."""
+    text = re.sub(
+        r"(?i)([\w-]*(?:password|passwort|token|csrf|salt|privatekey)[\w-]*\s*[:=]\s*)[^,\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:token|csrf|password|passwort)=)[^&\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    match = re.search(r"(?i)\bText:\s*", text)
+    if match:
+        text = text[:match.start()] + match.group(0) + "[SMS-Inhalt ausgelassen]"
+    return text
+
+
 class QueueLogger:
-    """
-    Leitet print()-Ausgaben gleichzeitig in die Konsole
-    und in die GUI weiter.
-    """
+    """Forward print output to the console, GUI, and a rotating redacted log."""
 
     def __init__(self, original_stdout):
         self.original_stdout = original_stdout
+        self._buffer = ""
+        self._lock = threading.RLock()
+        self.file_logger = logging.getLogger("cudy_auto_refill")
+        self.file_logger.setLevel(logging.INFO)
+        self.file_logger.propagate = False
+        if not self.file_logger.handlers:
+            try:
+                os.makedirs(APP_DATA_DIR, exist_ok=True)
+                handler = RotatingFileHandler(
+                    APP_LOG_FILE, maxBytes=1_000_000, backupCount=3,
+                    encoding="utf-8",
+                )
+                handler.setFormatter(logging.Formatter(
+                    "%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+                ))
+                self.file_logger.addHandler(handler)
+            except OSError:
+                self.file_logger = None
 
-    def write(self, text):
-        if text:
-            self.original_stdout.write(text)
+    def write(self, value):
+        if not value:
+            return
+        with self._lock:
+            self.original_stdout.write(value)
             self.original_stdout.flush()
-
-            log_queue.put(
-                ("log", text)
-            )
+            log_queue.put(("log", value))
+            self._buffer += value
+            while "\n" in self._buffer:
+                line, self._buffer = self._buffer.split("\n", 1)
+                if self.file_logger:
+                    self.file_logger.info(redact_log_line(line.rstrip("\r")))
 
     def flush(self):
-        self.original_stdout.flush()
-
-
+        with self._lock:
+            self.original_stdout.flush()
+            if self._buffer:
+                if self.file_logger:
+                    self.file_logger.info(redact_log_line(self._buffer))
+                self._buffer = ""
+            if self.file_logger:
+                for handler in self.file_logger.handlers:
+                    handler.flush()
 # ============================================================
 # SESSION
 # ============================================================
@@ -187,6 +352,8 @@ HEADERS = {
 letzter_erfolgreicher_poll = time.monotonic()
 letzter_session_refresh = time.monotonic()
 poll_fehler = 0
+session_recovery_retry_at = 0.0
+session_recovery_retry_delay = SESSION_RECOVERY_BASE_SECONDS
 
 
 # ============================================================
@@ -252,9 +419,12 @@ def hole_token():
 
 
 def login():
+    global PASSWORT
     print()
     print("🔐 Starte Cudy Login...")
 
+    if not PASSWORT:
+        PASSWORT = lade_router_passwort()
     if not PASSWORT:
         print("❌ Router-Passwort fehlt. Lege es in cudy_credentials.json oder CUDY_ROUTER_PASSWORD ab.")
         gui_status("router", "Passwort fehlt")
@@ -428,6 +598,10 @@ def hole_sms_seite(
         )
 
     response.raise_for_status()
+    if BeautifulSoup(response.text, "html.parser").find(
+        "input", {"name": "luci_password"}
+    ):
+        raise PermissionError("Cudy-Session abgelaufen (Login-Seite mit HTTP 200).")
 
     return response.text
 
@@ -807,6 +981,17 @@ def sms_id(sms):
 
 def lade_sms_state():
 
+    if (
+        not os.path.exists(SMS_STATE_FILE)
+        and os.path.exists(LEGACY_SMS_STATE_FILE)
+    ):
+        try:
+            os.makedirs(APP_DATA_DIR, exist_ok=True)
+            shutil.copy2(LEGACY_SMS_STATE_FILE, SMS_STATE_FILE)
+            print("📁 Vorhandene SMS-States ins Windows-Benutzerprofil übernommen.")
+        except OSError as exc:
+            print("⚠️ SMS-States konnten nicht übernommen werden:", exc)
+
     if not os.path.exists(
         SMS_STATE_FILE
     ):
@@ -844,6 +1029,7 @@ def lade_sms_state():
 
 def speichere_sms_state(state):
 
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
     temp_file = (
         SMS_STATE_FILE
         + ".tmp"
@@ -1977,53 +2163,38 @@ def poll():
 def session_recovery():
     global letzter_session_refresh
     global letzter_erfolgreicher_poll
+    global session_recovery_retry_at
+    global session_recovery_retry_delay
+
+    if time.monotonic() < session_recovery_retry_at:
+        return False
 
     print()
-
-    print(
-        "🔄 SESSION-RECOVERY..."
-    )
-
-    gui_status(
-        "status",
-        "Session-Recovery"
-    )
-
+    print("🔄 SESSION-RECOVERY...")
+    gui_status("status", "Session-Recovery")
     session.cookies.clear()
 
     if login():
-
-        letzter_session_refresh = (
-            time.monotonic()
-        )
-
-        letzter_erfolgreicher_poll = (
-            time.monotonic()
-        )
-
-        print(
-            "🟢 Session-Recovery erfolgreich."
-        )
-
-        gui_status(
-            "status",
-            "Aktiv"
-        )
-
+        session_recovery_retry_at = 0.0
+        session_recovery_retry_delay = SESSION_RECOVERY_BASE_SECONDS
+        letzter_session_refresh = time.monotonic()
+        letzter_erfolgreicher_poll = time.monotonic()
+        print("🟢 Session-Recovery erfolgreich.")
+        gui_status("status", "Aktiv")
         return True
 
+    print("🔴 Session-Recovery fehlgeschlagen.")
     print(
-        "🔴 Session-Recovery fehlgeschlagen."
+        f"⏳ Nächster Session-Recovery-Versuch in "
+        f"{session_recovery_retry_delay} Sekunden."
     )
-
-    gui_status(
-        "status",
-        "Fehler"
+    session_recovery_retry_at = time.monotonic() + session_recovery_retry_delay
+    session_recovery_retry_delay = min(
+        session_recovery_retry_delay * 2,
+        SESSION_RECOVERY_MAX_SECONDS,
     )
-
+    gui_status("status", "Fehler")
     return False
-
-
 # ============================================================
 # BACKEND HAUPTSCHLEIFE
 # ============================================================
@@ -2105,27 +2276,25 @@ def hauptschleife():
     # ERSTER LOGIN
     # --------------------------------------------------------
 
+    login_retry_delay = LOGIN_RETRY_BASE_SECONDS
     while programm_laeuft:
-
         if login():
             break
 
         print()
-
+        print("⏳ Login fehlgeschlagen.")
         print(
-            "⏳ Login fehlgeschlagen."
+            f"🔄 Neuer Versuch in {login_retry_delay} Sekunden "
+            f"(maximal {LOGIN_RETRY_MAX_SECONDS})."
         )
-
-        print(
-            "🔄 Neuer Versuch in 10 Sekunden..."
-        )
-
-        for _ in range(10):
-
+        for _ in range(login_retry_delay):
             if not programm_laeuft:
                 return
-
             time.sleep(1)
+        login_retry_delay = min(
+            login_retry_delay * 2,
+            LOGIN_RETRY_MAX_SECONDS,
+        )
 
     letzter_session_refresh = (
         time.monotonic()
@@ -3629,6 +3798,12 @@ class CudyGUI:
         self.log_clear_button.pack(
             side="left"
         )
+        self.log_copy_button = ttk.Button(
+            button_frame,
+            text="📋 Diagnose kopieren",
+            command=self.diagnose_kopieren,
+        )
+        self.log_copy_button.pack(side="left", padx=(8, 0))
 
         # ----------------------------------------------------
         # LOG
@@ -4144,29 +4319,69 @@ class CudyGUI:
             status_var.set("Bandwahl wird gespeichert; LTE verbindet sich neu …")
 
             def apply_worker():
-                error = None
+                outcome = {"status": "failed", "error": "Bandwechsel fehlgeschlagen."}
+
+                def progress(message):
+                    try:
+                        self.root.after(
+                            0,
+                            lambda message=message: (
+                                status_var.set(message) if fenster.winfo_exists() else None
+                            ),
+                        )
+                    except tk.TclError:
+                        pass
+
                 try:
-                    apply_band_config(
+                    progress("Bandwahl wird angewendet …")
+                    outcome = apply_band_config_with_fallback(
                         session, BASE_URL, router_session_sicherstellen,
-                        automatic, selected,
+                        automatic, selected, progress=progress, timeout=60,
                     )
                 except Exception as exc:
-                    error = str(exc)
+                    outcome = {"status": "failed", "error": str(exc)}
 
                 def finish_apply():
                     try:
                         if not fenster.winfo_exists():
                             return
-                        if error:
-                            status_var.set("Speichern fehlgeschlagen: " + error)
-                            apply_button.config(state="normal")
-                        else:
+                        kind = outcome["status"]
+                        if kind == "applied":
                             fenster.destroy()
                             self.signal_aktualisieren()
                             print(
-                                "✅ LTE-Bandwahl wurde gespeichert und vom Router "
-                                "zurückbestätigt. Die LTE-Verbindung baut sich neu auf."
+                                "✅ LTE-Bandwahl gespeichert; Router und Internet "
+                                "sind wieder erreichbar."
                             )
+                        elif kind == "restored":
+                            previous = outcome["previous"]
+                            auto_var.set(previous["automatic"])
+                            for band in LTE_BANDS:
+                                band_vars[band].set(band in previous["selected"])
+                            update_states()
+                            status_var.set(
+                                "Neue Bandwahl ohne Internet. Die vorherige Auswahl "
+                                "wurde wiederhergestellt."
+                            )
+                            apply_button.config(state="normal")
+                            print(
+                                "⚠️ LTE-Bandwahl zurückgerollt; vorherige Auswahl "
+                                "und Internetverbindung wiederhergestellt."
+                            )
+                        elif kind == "restore_failed":
+                            status_var.set(
+                                "Bandwechsel fehlgeschlagen; auch die Wiederherstellung "
+                                "konnte nicht bestätigt werden. Bitte Routerverbindung "
+                                "und Bandwahl prüfen."
+                            )
+                            apply_button.config(state="normal")
+                            print(
+                                "❌ LTE-Bandwechsel fehlgeschlagen:", outcome["error"],
+                                "| Wiederherstellung:", outcome["restore_error"]
+                            )
+                        else:
+                            status_var.set("Speichern fehlgeschlagen: " + outcome["error"])
+                            apply_button.config(state="normal")
                     except tk.TclError:
                         pass
 
@@ -4215,10 +4430,23 @@ class CudyGUI:
             self.watchdog_var.get()
         )
 
-        BASE_URL = self.router_entry.get().strip() or BASE_URL
+        BASE_URL = (self.router_entry.get().strip() or BASE_URL).rstrip("/")
         POLL_INTERVAL = neuer_poll
         SESSION_REFRESH_INTERVAL = neuer_session_refresh
         WATCHDOG_TIMEOUT = neuer_watchdog
+
+        if not speichere_app_einstellungen({
+            "router_url": BASE_URL,
+            "poll_interval": POLL_INTERVAL,
+            "session_refresh_interval": SESSION_REFRESH_INTERVAL,
+            "watchdog_timeout": WATCHDOG_TIMEOUT,
+        }):
+            messagebox.showwarning(
+                "Einstellungen nicht gespeichert",
+                "Die Werte gelten in dieser Sitzung, konnten aber nicht für den "
+                "nächsten Start gespeichert werden.",
+                parent=self.root,
+            )
 
         # Zeitgeber beim Speichern neu starten, damit die
         # neue Einstellung sofort und ohne alten Restwert greift.
@@ -4244,6 +4472,37 @@ class CudyGUI:
         gui_status(
             "status",
             "Einstellungen gespeichert"
+        )
+
+    # ========================================================
+    # DIAGNOSE KOPIEREN
+    # ========================================================
+
+    def diagnose_kopieren(self):
+        try:
+            with open(APP_LOG_FILE, "r", encoding="utf-8") as f:
+                log_lines = f.readlines()[-250:]
+        except OSError:
+            log_lines = []
+        safe_lines = [redact_log_line(line.rstrip()) for line in log_lines]
+        report = [
+            "Cudy Auto Refill – Diagnose",
+            f"Python: {sys.version.split()[0]}",
+            f"Plattform: {sys.platform}",
+            "Status: " + ", ".join(
+                f"{key}={value}" for key, value in status_data.items()
+            ),
+            "",
+            "Letzte Protokollzeilen (SMS-Inhalte und Geheimnisse redigiert):",
+            *safe_lines,
+        ]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(report))
+        self.root.update_idletasks()
+        messagebox.showinfo(
+            "Diagnose kopiert",
+            "Der redigierte Diagnosebericht ist in der Zwischenablage.",
+            parent=self.root,
         )
 
     # ========================================================
@@ -4297,6 +4556,10 @@ class CudyGUI:
                         "end",
                         text
                     )
+                    line_count = int(self.log_text.index("end-1c").split(".")[0])
+                    if line_count > MAX_GUI_LOG_LINES:
+                        excess_lines = line_count - MAX_GUI_LOG_LINES
+                        self.log_text.delete("1.0", f"{excess_lines + 1}.0")
 
                     self.log_text.see(
                         "end"

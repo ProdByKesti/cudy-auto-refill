@@ -11,8 +11,9 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Refill reply verification by checking for a new matching item in the outbox
 - Per-SMS attempt tracking in a local JSON state file
 - Inbox and outbox cleanup when configured message-count thresholds are reached
-- Session refresh and watchdog recovery
-- Manual selection of the LTE bands exposed by the router
+- Session refresh and watchdog recovery with capped retry backoff
+- Manual LTE band selection with internet verification and automatic rollback if the connection does not recover
+- Rotating, timestamped local logs and a redacted diagnostic-copy action
 - All-band comparison of download throughput, HTTP probe latency, and jitter; the previous band selection is restored after a scan
 - One-time speed-test prompt on the first packaged EXE launch, with a repeatable test in the Signal tab
 
@@ -30,13 +31,9 @@ python -m pip install -r requirements.txt
 
 ## Router credentials
 
-Create `cudy_credentials.json` from the example and enter the router password locally:
+For a local Python setup, create `cudy_credentials.json` from the example (for example with `Copy-Item cudy_credentials.example.json cudy_credentials.json`) and enter the router password locally.
 
-```powershell
-Copy-Item cudy_credentials.example.json cudy_credentials.json
-```
-
-The credentials file is excluded by `.gitignore`. You can instead set `CUDY_ROUTER_PASSWORD` in the process environment. Never commit router credentials.
+On Windows, the app imports that password on first login into `%LOCALAPPDATA%/CudyAutoRefill/router_password.dpapi`, protected with Windows DPAPI for the current Windows user. The source JSON is intentionally left in place; remove it manually after confirming the app can log in. The app also accepts `CUDY_ROUTER_PASSWORD` from the process environment. Never package or commit credentials.
 
 ## Run
 
@@ -48,17 +45,19 @@ The program only starts monitoring after you press Start in the GUI. It can send
 
 ## Working copy
 
-`main_settings_only_fixed2.py` is the original user-supplied version and remains unchanged because it may be running in the background. Continue development in `cudy_auto_refill.py`, which starts as an identical copy. Do not run it alongside the original; both versions can process the same router inbox and share `sms_state.json`.
+`main_settings_only_fixed2.py` is the original user-supplied version and remains unchanged because it may be running in the background. Continue development in `cudy_auto_refill.py`. Stop the original before running the working copy; both can process the same router inbox. The working copy migrates the old SMS state to the Windows user profile on first use.
 
 ## Local data
 
-`sms_state.json` tracks message IDs, content, timestamps, and refill attempts/successes. The program creates or updates this file in its current working directory. If it is missing, an existing trigger SMS may be treated as unprocessed and cause another refill attempt. Keep this file local and do not delete it while trigger SMS messages remain in the inbox.
+Runtime state and logs are stored under `%LOCALAPPDATA%/CudyAutoRefill` regardless of the current working directory. On first use, an existing `sms_state.json` beside the working copy is copied there; the original is kept. The state tracks message IDs, content, timestamps, and refill attempts/successes. Do not delete it while trigger SMS messages remain in the inbox, or a message may be treated as unprocessed.
+
+The live GUI log is capped in memory. The rotating log keeps up to four files of about 1 MB each. The Log tab's Diagnose kopieren action redacts SMS bodies and credential-like values before copying a report.
 
 ## Current limitations
 
 - Polling for refill triggers reads the first inbox page.
 - The band comparison uses Cloudflare's public download endpoint. It transfers up to about 80 MB across ten bands and does not measure upload speed.
 - The reported latency and jitter are HTTP probe timings; failed probes are shown as request failures, not a dedicated radio packet-loss measurement.
-- Polling and watchdog settings apply at runtime and are not persisted between launches.
+- Poll interval, session refresh, watchdog, and router URL are stored in the per-user settings file.
 
 The LTE band controls use the LT300 V3 router's Cellular/APN form. The comparison reports the fastest download band and the band with the lowest measured latency and request-failure rate for latency-sensitive use. The manual emergency-send path in the working copy has now been live-tested: the router accepted the SMS and the outgoing `Refill` appeared in the outbox. The automated refill flow has not yet been independently live-tested in this working copy.

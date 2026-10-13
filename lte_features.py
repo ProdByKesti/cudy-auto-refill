@@ -142,8 +142,8 @@ def _cancelled(event):
     return event is not None and event.is_set()
 
 
-def _internet_ready(net, event, progress):
-    end = time.monotonic() + RECONNECT_SECONDS
+def _internet_ready(net, event, progress, timeout=RECONNECT_SECONDS):
+    end = time.monotonic() + timeout
     while time.monotonic() < end and not _cancelled(event):
         try:
             response = net.get(
@@ -158,6 +158,54 @@ def _internet_ready(net, event, progress):
                 progress("Warte auf LTE-Verbindung …")
             time.sleep(2.5)
     return False
+
+
+def wait_for_internet(progress=None, timeout=60):
+    """Check internet access after a manual LTE change without downloading data."""
+    net = requests.Session()
+    net.headers["User-Agent"] = "CudyAutoRefill connection check"
+    try:
+        return _internet_ready(net, None, progress, timeout)
+    finally:
+        net.close()
+
+
+def apply_band_config_with_fallback(
+    session, base_url, ensure_session, automatic, bands, progress=None, timeout=60
+):
+    """Apply a band choice and restore the previous config if internet stays down."""
+    previous = read_band_config(session, base_url, ensure_session)
+    apply_error = None
+    try:
+        apply_band_config(session, base_url, ensure_session, automatic, bands)
+        if wait_for_internet(progress=progress, timeout=timeout):
+            return {"status": "applied", "previous": previous}
+        apply_error = RuntimeError(
+            f"Nach {timeout} Sekunden war keine Internetverbindung erreichbar."
+        )
+    except Exception as exc:
+        apply_error = exc
+
+    if progress:
+        progress("Internet fehlt; vorherige Bandwahl wird wiederhergestellt …")
+    try:
+        apply_band_config(
+            session, base_url, ensure_session,
+            previous["automatic"], previous["selected"],
+        )
+        if wait_for_internet(progress=progress, timeout=timeout):
+            return {
+                "status": "restored", "previous": previous,
+                "error": str(apply_error),
+            }
+        restore_error = "Internet nach Wiederherstellung nicht erreichbar."
+    except Exception as exc:
+        restore_error = str(exc)
+
+    return {
+        "status": "restore_failed", "previous": previous,
+        "error": str(apply_error), "restore_error": restore_error,
+    }
 
 
 def _measure(net, event):
