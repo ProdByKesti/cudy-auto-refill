@@ -2,6 +2,29 @@
 
 This document captures longer-term ideas. It is a planning note, not a delivery promise or release schedule. Keep distribution and store costs low where practical, and verify current platform rules before choosing a release channel.
 
+## Mind map
+
+```mermaid
+mindmap
+  root((Cudy Auto Refill))
+    Stabilize router integration
+      Keep current Windows app reliable
+      Separate router logic from interface
+    Windows
+      Self-contained EXE
+      First-run setup and LTE band comparison
+    Android
+      Dedicated app and APK
+      Check background and local-network behavior
+      Compare direct APK and Google Play
+    iOS
+      Check mobile architecture and feasibility
+      Compare distribution options and costs
+    Release goals
+      Keep costs low where practical
+      Recheck platform rules before publishing
+```
+
 ## Direction
 
 - Keep the current working Windows application reliable while the router integration evolves.
