@@ -2395,13 +2395,20 @@ class CudyGUI:
             "Cudy Auto Refill"
         )
 
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = min(1000, max(640, screen_width - 24))
+        window_height = min(720, max(480, screen_height - 40))
+        window_x = max(0, (screen_width - window_width) // 2)
+        window_y = 0
+
         self.root.geometry(
-            "1000x700"
+            f"{window_width}x{window_height}+{window_x}+{window_y}"
         )
 
         self.root.minsize(
-            850,
-            600
+            min(850, max(640, screen_width - 24)),
+            min(640, max(480, screen_height - 40))
         )
 
         self.root.protocol(
@@ -2482,6 +2489,42 @@ class CudyGUI:
 
         self.notebook = ttk.Notebook(
             self.root
+        )
+
+        # ----------------------------------------------------
+        # START / STOP
+        # ----------------------------------------------------
+
+        button_frame = ttk.Frame(
+            self.root,
+            padding=(15, 5, 15, 10)
+        )
+
+        button_frame.pack(
+            side="bottom",
+            fill="x"
+        )
+
+        self.start_button = ttk.Button(
+            button_frame,
+            text="▶️ Start",
+            command=self.starten
+        )
+
+        self.start_button.pack(
+            side="left",
+            padx=(0, 5)
+        )
+
+        self.stop_button = ttk.Button(
+            button_frame,
+            text="⏹ Stop",
+            command=self.stoppen,
+            state="disabled"
+        )
+
+        self.stop_button.pack(
+            side="left"
         )
 
         self.notebook.pack(
@@ -2586,41 +2629,6 @@ class CudyGUI:
         )
 
         self.baue_log_tab()
-
-        # ----------------------------------------------------
-        # START / STOP
-        # ----------------------------------------------------
-
-        button_frame = ttk.Frame(
-            self.root,
-            padding=(15, 5, 15, 10)
-        )
-
-        button_frame.pack(
-            fill="x"
-        )
-
-        self.start_button = ttk.Button(
-            button_frame,
-            text="▶️ Start",
-            command=self.starten
-        )
-
-        self.start_button.pack(
-            side="left",
-            padx=(0, 5)
-        )
-
-        self.stop_button = ttk.Button(
-            button_frame,
-            text="⏹ Stop",
-            command=self.stoppen,
-            state="disabled"
-        )
-
-        self.stop_button.pack(
-            side="left"
-        )
 
     # ========================================================
     # ÜBERSICHT
