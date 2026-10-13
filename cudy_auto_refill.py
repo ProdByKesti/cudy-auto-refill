@@ -1123,16 +1123,43 @@ def refill_versuch(
     return False
 
 
+def router_session_sicherstellen():
+    """Reuse the current login; renew it only when the router rejects it."""
+    status_url = f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/status"
+    response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+    login_form = BeautifulSoup(response.text, "html.parser").find(
+        "input", {"name": "luci_password"}
+    )
+
+    if response.status_code == 403 or login_form:
+        print("🔐 Router-Session abgelaufen; erneuere Login einmalig.")
+        if not login():
+            print("❌ Manueller Refill fehlgeschlagen: Router-Login fehlgeschlagen.")
+            return False
+        response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+        login_form = BeautifulSoup(response.text, "html.parser").find(
+            "input", {"name": "luci_password"}
+        )
+
+    if response.status_code == 403 or login_form:
+        print("❌ Manueller Refill fehlgeschlagen: Router-Session nicht verfügbar.")
+        return False
+
+    response.raise_for_status()
+    return True
+
+
 def sende_neue_sms(empfaenger, nachricht):
     """Send a new SMS through the router's own New Message form."""
     status_url = (
         f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/status"
     )
     response = session.get(status_url, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 403 or "luci_password" in response.text:
-        if not login():
-            return False
-        response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+    login_form = BeautifulSoup(response.text, "html.parser").find(
+        "input", {"name": "luci_password"}
+    )
+    if response.status_code == 403 or login_form:
+        raise PermissionError("Router-Session ist vor dem SMS-Versand abgelaufen.")
 
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
@@ -3680,25 +3707,33 @@ class CudyGUI:
         self.test_refill_button.config(state="disabled")
 
         def worker():
+            print("🚨 Manueller Refill gestartet: sende 'Refill' an 80808.")
             try:
                 with REFILL_SEND_LOCK:
-                    if not login():
+                    if not router_session_sicherstellen():
+                        print("❌ Manueller Refill fehlgeschlagen: keine gültige Router-Session.")
                         return
+
                     vorher = outbox_snapshot()
                     if not sende_neue_sms(LIDL_ABSENDER, REFILL_TEXT):
+                        print("❌ Manueller Refill fehlgeschlagen: SMS wurde nicht an den Router übermittelt.")
                         return
+
                     time.sleep(3)
                     nachher = outbox_snapshot()
 
                 if nachher - vorher:
                     gui_status("letzter_refill", time.strftime("%H:%M:%S"))
-                    print("✅ Manueller Refill in der Outbox bestätigt.")
+                    print("✅ Manueller Refill erfolgreich: neue Refill-SMS in der Outbox bestätigt.")
                 else:
-                    print("⚠️ SMS an Router übermittelt, aber kein neuer Refill in der Outbox bestätigt.")
+                    print("⚠️ Manueller Refill unbestätigt: Router nahm die SMS an, aber die Outbox zeigt keinen neuen Refill.")
             except Exception as exc:
                 print("❌ Manueller Refill fehlgeschlagen:", exc)
             finally:
-                self.root.after(0, lambda: self.test_refill_button.config(state="normal"))
+                try:
+                    self.root.after(0, lambda: self.test_refill_button.config(state="normal"))
+                except tk.TclError:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
 
