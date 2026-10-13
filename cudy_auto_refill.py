@@ -213,10 +213,7 @@ def hole_token():
 
     token = response.text.strip()
 
-    print(
-        "🔑 Token erhalten:",
-        token[:8] + "..."
-    )
+    print("🔑 Router-Token erhalten.")
 
     return token
 
@@ -1165,10 +1162,27 @@ def sende_neue_sms(empfaenger, nachricht):
     soup = BeautifulSoup(response.text, "html.parser")
     form_response = response
     form_soup = soup
-    form = soup.find("form", {"name": "cbi"})
 
-    # Einige Firmware-Versionen zeigen das Compose-Formular direkt auf /sms,
-    # andere verlinken von dort auf eine separate New-Message-Seite.
+    def finde_sendeformular(html_soup):
+        for kandidat in html_soup.find_all("form", {"name": "cbi"}):
+            field_names = {
+                feld.get("name")
+                for feld in kandidat.find_all(["input", "textarea", "select"])
+                if feld.get("name")
+            }
+            if (
+                "cbid.smsnew.1.phone" in field_names
+                and "cbid.smsnew.1.content" in field_names
+            ):
+                return kandidat
+        return None
+
+    # The SMS page contains several LuCI forms: inbox, new message and outbox.
+    # Select the compose form by its actual field names instead of the first
+    # generic form named "cbi".
+    form = finde_sendeformular(soup)
+
+    # Some firmware versions load the compose form from a separate link.
     if not form:
         new_message_link = None
         for link in soup.find_all("a", href=True):
@@ -1177,18 +1191,16 @@ def sende_neue_sms(empfaenger, nachricht):
                 new_message_link = urljoin(response.url, link["href"])
                 break
 
-        if not new_message_link:
-            print("❌ SMS-Seite geöffnet, aber kein New-Message-Formular oder Link gefunden.")
-            return False
+        if new_message_link:
+            form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
+            if form_response.status_code == 403:
+                raise PermissionError("Router-Session ist vor dem SMS-Versand abgelaufen.")
+            form_response.raise_for_status()
+            form_soup = BeautifulSoup(form_response.text, "html.parser")
+            form = finde_sendeformular(form_soup)
 
-        form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
-        if form_response.status_code == 403:
-            raise PermissionError("Router-Session ist vor dem SMS-Versand abgelaufen.")
-        form_response.raise_for_status()
-        form_soup = BeautifulSoup(form_response.text, "html.parser")
-        form = form_soup.find("form", {"name": "cbi"})
     if not form:
-        print("❌ Formular für neue SMS wurde nicht gefunden.")
+        print("❌ New-Message-Formular mit den Feldern cbid.smsnew.1.phone/content nicht gefunden.")
         return False
 
     fields = {}
@@ -1213,8 +1225,23 @@ def sende_neue_sms(empfaenger, nachricht):
 
     fields[phone_names[0]] = empfaenger
     fields[text_names[0]] = nachricht
+
+    # The Cudy submit button is itself a named form field and must be included.
+    send_button = form.find(
+        ["button", "input"],
+        {"name": "cbid.smsnew.1.send"}
+    )
+    if send_button:
+        fields[send_button["name"]] = (
+            send_button.get("value")
+            or send_button.get_text(" ", strip=True)
+            or "Send"
+        )
+
     if "cbi.submit" in {item.get("name") for item in form.find_all("input")}:
         fields["cbi.submit"] = "1"
+    if "timeclock" in fields:
+        fields["timeclock"] = str(int(time.time()))
 
     action = form.get("action")
     if not action:
