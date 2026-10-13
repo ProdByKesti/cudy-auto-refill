@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+cudy_credentials.json
+sms_state.json
+sms_state.json.tmp
+*.log
+.vscode/
+
+# This folder contains several downloaded variants; publish only the selected baseline.
+/main*.py
+!/main_settings_only_fixed2.py
