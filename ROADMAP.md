@@ -7,23 +7,28 @@ This document captures longer-term ideas. It is a planning note, not a delivery 
 ```mermaid
 mindmap
   root((Cudy Auto Refill))
-    Stabilize router integration
-      Keep current Windows app reliable
-      Separate router logic from interface
-    Windows
+    Priority 1: Windows
+      Stabilize current router integration
       Self-contained EXE
       First-run setup and LTE band comparison
-    Android
+    Priority 2: Android
       Dedicated app and APK
       Check background and local-network behavior
       Compare direct APK and Google Play
-    iOS
+    Priority 3: iOS (last)
+      Revisit after Windows and Android
       Check mobile architecture and feasibility
       Compare distribution options and costs
     Release goals
       Keep costs low where practical
       Recheck platform rules before publishing
 ```
+
+## Priority
+
+1. **Windows first:** Keep the current desktop app reliable and prepare a self-contained `.exe`.
+2. **Android second:** Explore an installable `.apk` for family and friends, keeping distribution costs low.
+3. **iOS last:** Treat iOS as the lowest-priority target. Revisit it only after Windows and Android, when its technical and distribution costs can be assessed again.
 
 ## Direction
 
@@ -46,7 +51,7 @@ mindmap
 ## iOS
 
 - Explore an iPhone app after the shared logic and mobile architecture are clearer.
-- Confirm technical feasibility and the current Apple distribution requirements and fees before committing to a release route.
+- Confirm the current Apple distribution requirements and fees before committing to a release route.
 
 ## Release planning
 
