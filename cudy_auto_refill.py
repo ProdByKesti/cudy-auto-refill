@@ -1125,8 +1125,8 @@ def refill_versuch(
 
 def router_session_sicherstellen():
     """Reuse the current login; renew it only when the router rejects it."""
-    status_url = f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/status"
-    response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+    sms_page_url = f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms?iface=4g"
+    response = session.get(sms_page_url, timeout=REQUEST_TIMEOUT)
     login_form = BeautifulSoup(response.text, "html.parser").find(
         "input", {"name": "luci_password"}
     )
@@ -1136,7 +1136,7 @@ def router_session_sicherstellen():
         if not login():
             print("❌ Manueller Refill fehlgeschlagen: Router-Login fehlgeschlagen.")
             return False
-        response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+        response = session.get(sms_page_url, timeout=REQUEST_TIMEOUT)
         login_form = BeautifulSoup(response.text, "html.parser").find(
             "input", {"name": "luci_password"}
         )
@@ -1150,11 +1150,11 @@ def router_session_sicherstellen():
 
 
 def sende_neue_sms(empfaenger, nachricht):
-    """Send a new SMS through the router's own New Message form."""
-    status_url = (
-        f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/status"
+    """Send a new SMS from the Cudy SMS page supplied by the router UI."""
+    sms_page_url = (
+        f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms?iface=4g"
     )
-    response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+    response = session.get(sms_page_url, timeout=REQUEST_TIMEOUT)
     login_form = BeautifulSoup(response.text, "html.parser").find(
         "input", {"name": "luci_password"}
     )
@@ -1163,26 +1163,30 @@ def sende_neue_sms(empfaenger, nachricht):
 
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
-    new_message_link = None
-    for link in soup.find_all("a", href=True):
-        link_text = link.get_text(" ", strip=True).lower()
-        if "new message" in link_text or "neue nachricht" in link_text:
-            new_message_link = urljoin(response.url, link["href"])
-            break
+    form_response = response
+    form_soup = soup
+    form = soup.find("form", {"name": "cbi"})
 
-    if not new_message_link:
-        print("❌ Router-Link 'New Message' wurde nicht gefunden.")
-        return False
+    # Einige Firmware-Versionen zeigen das Compose-Formular direkt auf /sms,
+    # andere verlinken von dort auf eine separate New-Message-Seite.
+    if not form:
+        new_message_link = None
+        for link in soup.find_all("a", href=True):
+            link_text = link.get_text(" ", strip=True).lower()
+            if "new message" in link_text or "neue nachricht" in link_text:
+                new_message_link = urljoin(response.url, link["href"])
+                break
 
-    form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
-    if form_response.status_code == 403:
-        if not login():
+        if not new_message_link:
+            print("❌ SMS-Seite geöffnet, aber kein New-Message-Formular oder Link gefunden.")
             return False
-        form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
-    form_response.raise_for_status()
 
-    form_soup = BeautifulSoup(form_response.text, "html.parser")
-    form = form_soup.find("form", {"name": "cbi"})
+        form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
+        if form_response.status_code == 403:
+            raise PermissionError("Router-Session ist vor dem SMS-Versand abgelaufen.")
+        form_response.raise_for_status()
+        form_soup = BeautifulSoup(form_response.text, "html.parser")
+        form = form_soup.find("form", {"name": "cbi"})
     if not form:
         print("❌ Formular für neue SMS wurde nicht gefunden.")
         return False
