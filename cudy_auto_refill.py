@@ -3,12 +3,19 @@ import hashlib
 import time
 import json
 import os
+import sys
 import threading
 import queue
 import tkinter as tk
 from tkinter import ttk, messagebox
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from lte_features import (
+    LTE_BANDS,
+    apply_band_config,
+    read_band_config,
+    run_all_band_speedtest,
+)
 
 # ============================================================
 # KONFIGURATION
@@ -50,6 +57,32 @@ def lade_router_passwort():
 PASSWORT = lade_router_passwort()
 
 SMS_STATE_FILE = "sms_state.json"
+
+APP_DATA_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "CudyAutoRefill"
+)
+LTE_PROFILE_FILE = os.path.join(APP_DATA_DIR, "lte_profile.json")
+
+def lade_lte_profil():
+    try:
+        with open(LTE_PROFILE_FILE, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def speichere_lte_profil(value):
+    try:
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        temporary = LTE_PROFILE_FILE + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, LTE_PROFILE_FILE)
+    except OSError as exc:
+        print("⚠️ LTE-Profil konnte nicht gespeichert werden:", exc)
+
 
 # Polling
 POLL_INTERVAL = 10
@@ -2417,6 +2450,9 @@ class CudyGUI:
         )
 
         self.labels = {}
+        self._band_test_running = False
+        self._band_test_cancel = None
+        self._band_dialog = None
 
         # Einstellungen für die Überwachungsintervalle
         self.poll_interval_var = tk.StringVar(
@@ -2434,6 +2470,11 @@ class CudyGUI:
         self.root.after(
             100,
             self.update_gui
+        )
+
+        self.root.after(
+            500,
+            self.erster_start_speedtest
         )
 
     # ========================================================
@@ -3109,12 +3150,12 @@ class CudyGUI:
         )
 
         # ----------------------------------------------------
-        # AKTUELL NOCH NICHT AUSGELESEN
+        # LTE-BANDWAHL (ROUTERKONFIGURATION)
         # ----------------------------------------------------
 
         signal_frame = ttk.LabelFrame(
             tab,
-            text="📶 Mobilfunksignal",
+            text="📶 LTE-Bandwahl (Routerkonfiguration)",
             padding=20
         )
 
@@ -3124,7 +3165,7 @@ class CudyGUI:
 
         self.signal_value = ttk.Label(
             signal_frame,
-            text="Noch nicht ausgelesen",
+            text="Noch nicht gelesen",
             font=(
                 "Segoe UI",
                 18,
@@ -3192,32 +3233,77 @@ class CudyGUI:
         )
 
         # ----------------------------------------------------
-        # UPDATE
+        # LTE-BANDWAHL UND SPEEDTEST
         # ----------------------------------------------------
 
+        band_frame = ttk.LabelFrame(tab, text="📶 LTE-Bandvergleich", padding=15)
+        band_frame.pack(fill="x", pady=(20, 0))
+
+        ttk.Label(
+            band_frame,
+            text=(
+                "Downloadtempo, Ping und Jitter werden je Band gemessen. "
+                "Der Router verbindet sich dafür nacheinander mit jedem LTE-Band."
+            ),
+            wraplength=800
+        ).pack(anchor="w")
+
+        ttk.Label(
+            band_frame,
+            text=(
+                "Datenverbrauch: bis zu etwa 80 MB bei zehn Bändern "
+                "(zwei 4-MB-Downloads pro Band; Ping-Anfragen zusätzlich minimal)."
+            ),
+            wraplength=800
+        ).pack(anchor="w", pady=(6, 0))
+
+        buttons = ttk.Frame(band_frame)
+        buttons.pack(anchor="w", pady=(10, 0))
+
         self.signal_refresh_button = ttk.Button(
-            tab,
-            text="🔄 Aktualisieren",
+            buttons,
+            text="🔄 Bandwahl lesen",
             command=self.signal_aktualisieren
         )
+        self.signal_refresh_button.pack(side="left", padx=(0, 8))
 
-        self.signal_refresh_button.pack(
-            anchor="w",
-            pady=(20, 0)
+        self.band_speedtest_button = ttk.Button(
+            buttons,
+            text="🚀 Alle LTE-Bänder testen",
+            command=self.speedtest_alle_baender
         )
+        self.band_speedtest_button.pack(side="left")
+
+        self.band_speedtest_cancel_button = ttk.Button(
+            buttons,
+            text="Test abbrechen",
+            command=self.speedtest_abbrechen,
+            state="disabled"
+        )
+        self.band_speedtest_cancel_button.pack(side="left", padx=(8, 0))
+
+        self.band_speedtest_status = tk.StringVar(
+            value="Noch kein Bandvergleich durchgeführt."
+        )
+        ttk.Label(
+            band_frame,
+            textvariable=self.band_speedtest_status,
+            wraplength=800
+        ).pack(anchor="w", pady=(10, 0))
+
+        self.band_speedtest_results = tk.Text(
+            band_frame, height=8, wrap="word", state="disabled"
+        )
+        self.band_speedtest_results.pack(fill="x", pady=(8, 0))
 
         ttk.Label(
             tab,
             text=(
-                "Die automatische Signalüberwachung "
-                "wird im nächsten Schritt mit den "
-                "Cudy-Netzwerkdaten verbunden."
+                "Bitte stoppe die SMS-Überwachung vor einem Bandtest. "
+                "Du kannst den Vergleich später hier erneut starten."
             ),
             wraplength=800
-        ).pack(
-            anchor="w",
-            pady=(15, 0)
-        )
+        ).pack(anchor="w", pady=(15, 0))
 
     # ========================================================
     # EINSTELLUNGEN TAB
@@ -3696,15 +3782,190 @@ class CudyGUI:
     # SIGNAL AKTUALISIEREN
     # ========================================================
 
+    def erster_start_speedtest(self):
+        if not getattr(sys, "frozen", False):
+            return
+        profile = lade_lte_profil()
+        if profile.get("erststart_speedtest_gezeigt"):
+            return
+        profile["erststart_speedtest_gezeigt"] = True
+        speichere_lte_profil(profile)
+        if messagebox.askyesno(
+            "LTE-Einrichtung",
+            "Möchtest du jetzt alle verfügbaren LTE-Bänder vergleichen?\n\n"
+            "Der Router verbindet sich für jedes Band neu. Bei zehn Bändern "
+            "werden bis zu etwa 80 MB Mobilfunkdaten geladen.\n\n"
+            "Du kannst den Test später im Reiter „Signal“ erneut starten.",
+            parent=self.root
+        ):
+            self.speedtest_alle_baender(bestaetigung=False)
+
+    def speedtest_abbrechen(self):
+        if self._band_test_cancel is not None:
+            self._band_test_cancel.set()
+            self.band_speedtest_status.set(
+                "Abbruch angefordert; die vorherige Bandwahl wird wiederhergestellt …"
+            )
+
+    def speedtest_alle_baender(self, bestaetigung=True):
+        if self._band_test_running:
+            return
+        if programm_laeuft:
+            messagebox.showinfo(
+                "Überwachung anhalten",
+                "Bitte stoppe zuerst die SMS-Überwachung. Der LTE-Test baut "
+                "die Mobilfunkverbindung mehrfach neu auf.",
+                parent=self.root
+            )
+            return
+        if bestaetigung and not messagebox.askyesno(
+            "Alle LTE-Bänder testen?",
+            "Der Test schaltet nacheinander jedes verfügbare LTE-Band ein. "
+            "Dabei wird die Verbindung mehrfach kurz getrennt.\n\n"
+            "Bei zehn Bändern werden bis zu etwa 80 MB Mobilfunkdaten "
+            "heruntergeladen. Die vorherige Bandwahl wird danach "
+            "wiederhergestellt.\n\nJetzt starten?",
+            parent=self.root
+        ):
+            return
+
+        self._band_test_running = True
+        self._band_test_cancel = threading.Event()
+        self.band_speedtest_button.config(state="disabled")
+        self.start_button.config(state="disabled")
+        self.band_speedtest_cancel_button.config(state="normal")
+        self.band_speedtest_status.set("Router-Bandeinstellungen werden gelesen …")
+        self.band_speedtest_results.config(state="normal")
+        self.band_speedtest_results.delete("1.0", "end")
+        self.band_speedtest_results.config(state="disabled")
+
+        def progress(message):
+            try:
+                self.root.after(
+                    0, lambda message=message: self.band_speedtest_status.set(message)
+                )
+            except tk.TclError:
+                pass
+
+        def worker():
+            outcome, error = None, None
+            try:
+                outcome = run_all_band_speedtest(
+                    session, BASE_URL, router_session_sicherstellen,
+                    progress=progress, cancel_event=self._band_test_cancel,
+                )
+                profile = lade_lte_profil()
+                profile["letzter_bandtest"] = outcome
+                speichere_lte_profil(profile)
+                if outcome.get("restored"):
+                    print("✅ Vorherige LTE-Bandwahl wurde wiederhergestellt.")
+                else:
+                    print(
+                        "❌ Vorherige LTE-Bandwahl konnte nicht wiederhergestellt werden:",
+                        outcome.get("restore_error")
+                    )
+            except Exception as exc:
+                error = str(exc)
+                print("❌ LTE-Bandtest fehlgeschlagen:", exc)
+
+            def finish():
+                self._band_test_running = False
+                self._band_test_cancel = None
+                self.band_speedtest_button.config(state="normal")
+                if not programm_laeuft:
+                    self.start_button.config(state="normal")
+                self.band_speedtest_cancel_button.config(state="disabled")
+                if error:
+                    self.band_speedtest_status.set("Bandvergleich fehlgeschlagen: " + error)
+                    return
+                if not outcome:
+                    self.band_speedtest_status.set("Keine Messergebnisse vorhanden.")
+                    return
+
+                lines = []
+                for item in outcome["results"]:
+                    band = item["band"]
+                    if item.get("download_mbps") is None:
+                        lines.append(f"B{band}: {item.get('status', 'keine Messung')}")
+                        continue
+                    ping = item["ping_ms"]
+                    jitter = item.get("jitter_ms")
+                    jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
+                    lines.append(
+                        f"B{band}: Download {item['download_mbps']:.1f} Mbit/s"
+                        f" | Ping {ping:.0f} ms | Jitter {jitter_text}"
+                        f" | Fehlversuche {item.get('loss_percent', 0):.0f}%"
+                    )
+
+                download_best = outcome.get("download_best")
+                gaming_best = outcome.get("gaming_best")
+                if download_best:
+                    lines.append(
+                        f"\nDownload-Empfehlung: B{download_best['band']} "
+                        f"({download_best['download_mbps']:.1f} Mbit/s)"
+                    )
+                if gaming_best:
+                    jitter = gaming_best.get("jitter_ms")
+                    jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
+                    lines.append(
+                        f"Gaming/Streaming nach Latenz: B{gaming_best['band']} "
+                        f"(Ping {gaming_best['ping_ms']:.0f} ms, Jitter {jitter_text})"
+                    )
+                if outcome.get("error"):
+                    lines.append("\nTest vorzeitig beendet: " + outcome["error"])
+                if not outcome.get("restored"):
+                    lines.append(
+                        "\nACHTUNG: Vorherige Bandwahl bitte unter "
+                        "„LTE-Bänder verwalten“ prüfen."
+                    )
+
+                self.band_speedtest_results.config(state="normal")
+                self.band_speedtest_results.insert("1.0", "\n".join(lines))
+                self.band_speedtest_results.config(state="disabled")
+                self.band_speedtest_status.set(
+                    "Test abgebrochen; Wiederherstellung wurde versucht."
+                    if outcome.get("cancelled")
+                    else (
+                        "Bandvergleich mit Fehler beendet."
+                        if outcome.get("error")
+                        else "Bandvergleich abgeschlossen."
+                    )
+                )
+                self.signal_aktualisieren()
+
+            try:
+                self.root.after(0, finish)
+            except tk.TclError:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ========================================================
+    # SIGNAL AKTUALISIEREN
+    # ========================================================
+
     def signal_aktualisieren(self):
+        if programm_laeuft:
+            return
 
-        self.signal_value.config(
-            text="Noch nicht implementiert"
-        )
+        def worker():
+            try:
+                config = read_band_config(session, BASE_URL, router_session_sicherstellen)
+                text = (
+                    "Automatische Bandwahl"
+                    if config["automatic"]
+                    else "Manuell: " + ", ".join("B" + band for band in config["selected"])
+                )
+            except Exception as exc:
+                text = "Bandwahl konnte nicht gelesen werden: " + str(exc)
+            try:
+                self.root.after(
+                    0, lambda text=text: self.signal_value.config(text=text)
+                )
+            except tk.TclError:
+                pass
 
-        print(
-            "📡 Signal-Aktualisierung angefordert."
-        )
+        threading.Thread(target=worker, daemon=True).start()
 
     # ========================================================
     # TEST REFILL
@@ -3757,55 +4018,151 @@ class CudyGUI:
     # ========================================================
 
     def baender_verwalten(self):
-
-        fenster = tk.Toplevel(
-            self.root
-        )
-
-        fenster.title(
-            "📶 LTE-Bänder"
-        )
-
-        fenster.geometry(
-            "400x350"
-        )
-
-        fenster.transient(
-            self.root
-        )
-
-        ttk.Label(
-            fenster,
-            text="LTE-Bänder",
-            font=(
-                "Segoe UI",
-                16,
-                "bold"
+        if programm_laeuft or self._band_test_running:
+            messagebox.showinfo(
+                "Überwachung anhalten",
+                "Bitte stoppe zuerst die SMS-Überwachung und laufende Bandtests.",
+                parent=self.root
             )
-        ).pack(
-            pady=(20, 10)
-        )
+            return
+
+        fenster = tk.Toplevel(self.root)
+        self._band_dialog = fenster
+        fenster.title("📶 LTE-Bänder")
+        fenster.geometry("470x470")
+        fenster.transient(self.root)
+        fenster.grab_set()
 
         ttk.Label(
-            fenster,
-            text=(
-                "Die eigentliche Cudy-Bandsteuerung "
-                "kommt nach dem Auslesen der "
-                "entsprechenden Router-API."
-            ),
-            wraplength=350,
-            justify="center"
-        ).pack(
-            padx=20
-        )
+            fenster, text="LTE-Bandwahl", font=("Segoe UI", 16, "bold")
+        ).pack(pady=(18, 8))
+        status_var = tk.StringVar(value="Router-Bandeinstellungen werden geladen …")
+        ttk.Label(
+            fenster, textvariable=status_var, wraplength=420, justify="left"
+        ).pack(anchor="w", padx=20, pady=(0, 12))
 
-        ttk.Button(
-            fenster,
-            text="Schließen",
-            command=fenster.destroy
-        ).pack(
-            pady=20
-        )
+        auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            fenster, text="Automatische Bandwahl", variable=auto_var
+        ).pack(anchor="w", padx=20)
+
+        band_frame = ttk.LabelFrame(fenster, text="LTE-Bänder", padding=12)
+        band_frame.pack(fill="x", padx=20, pady=10)
+        band_vars = {band: tk.BooleanVar(value=False) for band in LTE_BANDS}
+        band_widgets = {}
+        for index, band in enumerate(LTE_BANDS):
+            widget = ttk.Checkbutton(
+                band_frame, text="B" + band, variable=band_vars[band]
+            )
+            widget.grid(row=index // 3, column=index % 3, sticky="w", padx=8, pady=5)
+            band_widgets[band] = widget
+
+        available_bands = set()
+
+        def update_states(*_):
+            for band, widget in band_widgets.items():
+                state = "disabled" if auto_var.get() or band not in available_bands else "normal"
+                widget.config(state=state)
+
+        auto_var.trace_add("write", update_states)
+
+        controls = ttk.Frame(fenster)
+        controls.pack(side="bottom", fill="x", padx=20, pady=16)
+        apply_button = ttk.Button(controls, text="Bandwahl anwenden", state="disabled")
+        apply_button.pack(side="left")
+        ttk.Button(controls, text="Schließen", command=fenster.destroy).pack(side="right")
+
+        def finish_load(config=None, error=None):
+            try:
+                if not fenster.winfo_exists():
+                    return
+                if error:
+                    status_var.set("Fehler: " + error)
+                    return
+                available_bands.update(config["available"])
+                auto_var.set(config["automatic"])
+                for band in LTE_BANDS:
+                    band_vars[band].set(band in config["selected"])
+                update_states()
+                status_var.set(
+                    "Wähle Automatik oder mindestens ein Band. "
+                    "LTE verbindet sich nach der Änderung neu."
+                )
+                apply_button.config(state="normal")
+            except tk.TclError:
+                pass
+
+        def load_worker():
+            try:
+                config = read_band_config(session, BASE_URL, router_session_sicherstellen)
+                self.root.after(0, lambda config=config: finish_load(config=config))
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    self.root.after(0, lambda error=error: finish_load(error=error))
+                except tk.TclError:
+                    pass
+
+        def apply_selection():
+            if programm_laeuft or self._band_test_running:
+                messagebox.showinfo(
+                    "Überwachung anhalten",
+                    "Bitte stoppe zuerst die SMS-Überwachung.",
+                    parent=fenster
+                )
+                return
+            automatic = auto_var.get()
+            selected = [band for band, var in band_vars.items() if var.get()]
+            if not automatic and not selected:
+                messagebox.showwarning(
+                    "Band auswählen",
+                    "Mindestens ein LTE-Band aktivieren oder Automatik wählen.",
+                    parent=fenster
+                )
+                return
+            if not messagebox.askyesno(
+                "LTE-Bandwahl anwenden?",
+                "Die Mobilfunkverbindung wird kurz getrennt und mit der "
+                "neuen Bandwahl wieder aufgebaut.",
+                parent=fenster
+            ):
+                return
+            apply_button.config(state="disabled")
+            status_var.set("Bandwahl wird gespeichert; LTE verbindet sich neu …")
+
+            def apply_worker():
+                error = None
+                try:
+                    apply_band_config(
+                        session, BASE_URL, router_session_sicherstellen,
+                        automatic, selected,
+                    )
+                except Exception as exc:
+                    error = str(exc)
+
+                def finish_apply():
+                    try:
+                        if not fenster.winfo_exists():
+                            return
+                        if error:
+                            status_var.set("Speichern fehlgeschlagen: " + error)
+                            apply_button.config(state="normal")
+                        else:
+                            fenster.destroy()
+                            self.signal_aktualisieren()
+                            print("✅ LTE-Bandwahl wurde an den Router übermittelt.")
+                    except tk.TclError:
+                        pass
+
+                try:
+                    self.root.after(0, finish_apply)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=apply_worker, daemon=True).start()
+
+        apply_button.config(command=apply_selection)
+        threading.Thread(target=load_worker, daemon=True).start()
 
     # ========================================================
     # EINSTELLUNGEN SPEICHERN

@@ -12,7 +12,9 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Per-SMS attempt tracking in a local JSON state file
 - Inbox and outbox cleanup when configured message-count thresholds are reached
 - Session refresh and watchdog recovery
-- GUI controls for router URL and runtime polling intervals
+- Manual selection of the LTE bands exposed by the router
+- All-band comparison of download throughput, HTTP probe latency, and jitter; the previous band selection is restored after a scan
+- One-time speed-test prompt on the first packaged EXE launch, with a repeatable test in the Signal tab
 
 ## Requirements
 
@@ -55,7 +57,8 @@ The program only starts monitoring after you press Start in the GUI. It can send
 ## Current limitations
 
 - Polling for refill triggers reads the first inbox page.
-- Signal reading and LTE band management are not connected to the router API yet.
+- The band comparison uses Cloudflare's public download endpoint. It transfers up to about 80 MB across ten bands and does not measure upload speed.
+- The reported latency and jitter are HTTP probe timings; failed probes are shown as request failures, not a dedicated radio packet-loss measurement.
 - Polling and watchdog settings apply at runtime and are not persisted between launches.
 
-The original version's working behavior was reported by the project owner. The manual emergency-send path in the working copy has now been live-tested: the router accepted the SMS and the outgoing `Refill` appeared in the outbox. The automated refill flow has not yet been independently live-tested in this working copy.
+The LTE band controls use the LT300 V3 router's Cellular/APN form. The comparison reports the fastest download band and the band with the lowest measured latency and request-failure rate for latency-sensitive use. The manual emergency-send path in the working copy has now been live-tested: the router accepted the SMS and the outgoing `Refill` appeared in the outbox. The automated refill flow has not yet been independently live-tested in this working copy.
