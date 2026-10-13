@@ -6,7 +6,8 @@ import os
 import threading
 import queue
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 # ============================================================
@@ -70,9 +71,15 @@ LIDL_ABSENDER = "80808"
 REFILL_TRIGGERS = [
     "fast verbraucht",
     "antworte einfach auf diese sms mit refill",
+    "option verbraucht",
+    "option ist jetzt verbraucht",
+    "option ist verbraucht",
+    "option wurde verbraucht",
+    "option aufgebraucht",
 ]
 
 REFILL_TEXT = "Refill"
+REFILL_SEND_LOCK = threading.Lock()
 
 # ------------------------------------------------------------
 # SMS CLEANUP
@@ -522,21 +529,15 @@ def lese_sms(html):
             )
         )
 
-        if not phone_element:
-            continue
-
         if not content_element:
             continue
 
         if not timestamp_element:
             continue
 
-        phone = phone_element.find("p")
+        phone = phone_element.find("p") if phone_element else None
         content = content_element.find("p")
         timestamp = timestamp_element.find("p")
-
-        if not phone:
-            continue
 
         if not content:
             continue
@@ -546,9 +547,7 @@ def lese_sms(html):
 
         sms = {
             "phone":
-                phone.get_text(
-                    strip=True
-                ),
+                phone.get_text(strip=True) if phone else "",
 
             "content":
                 content.get_text(
@@ -618,21 +617,15 @@ def lese_sms_mit_cfg(html):
             )
         )
 
-        if not phone_element:
-            continue
-
         if not content_element:
             continue
 
         if not timestamp_element:
             continue
 
-        phone = phone_element.find("p")
+        phone = phone_element.find("p") if phone_element else None
         content = content_element.find("p")
         timestamp = timestamp_element.find("p")
-
-        if not phone:
-            continue
 
         if not content:
             continue
@@ -640,9 +633,7 @@ def lese_sms_mit_cfg(html):
         if not timestamp:
             continue
 
-        phone_text = phone.get_text(
-            strip=True
-        )
+        phone_text = phone.get_text(strip=True) if phone else ""
 
         content_text = content.get_text(
             strip=True
@@ -982,14 +973,14 @@ def sende_reply(
         }
     )
 
-    if phone_field:
+    empfaenger = phone_field.get("value", "").strip() if phone_field else ""
+    if empfaenger != LIDL_ABSENDER:
+        print("❌ Reply abgebrochen: Absendernummer im Detailformular ist nicht eindeutig 80808.")
+        return False
 
-        daten[
-            "cbid.smsread.1.phone"
-        ] = phone_field.get(
-            "value",
-            ""
-        )
+    daten[
+        "cbid.smsread.1.phone"
+    ] = empfaenger
 
     daten[
         "cbid.smsread.1.content"
@@ -1070,10 +1061,11 @@ def refill_versuch(
         "🔄 Starte EINEN Refill-Versuch..."
     )
 
-    erfolg = sende_reply(
-        cfg,
-        REFILL_TEXT
-    )
+    with REFILL_SEND_LOCK:
+        erfolg = sende_reply(
+            cfg,
+            REFILL_TEXT
+        )
 
     if not erfolg:
         return False
@@ -1129,6 +1121,84 @@ def refill_versuch(
     )
 
     return False
+
+
+def sende_neue_sms(empfaenger, nachricht):
+    """Send a new SMS through the router's own New Message form."""
+    status_url = (
+        f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/status"
+    )
+    response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+    if response.status_code == 403 or "luci_password" in response.text:
+        if not login():
+            return False
+        response = session.get(status_url, timeout=REQUEST_TIMEOUT)
+
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    new_message_link = None
+    for link in soup.find_all("a", href=True):
+        link_text = link.get_text(" ", strip=True).lower()
+        if "new message" in link_text or "neue nachricht" in link_text:
+            new_message_link = urljoin(response.url, link["href"])
+            break
+
+    if not new_message_link:
+        print("❌ Router-Link 'New Message' wurde nicht gefunden.")
+        return False
+
+    form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
+    if form_response.status_code == 403:
+        if not login():
+            return False
+        form_response = session.get(new_message_link, timeout=REQUEST_TIMEOUT)
+    form_response.raise_for_status()
+
+    form_soup = BeautifulSoup(form_response.text, "html.parser")
+    form = form_soup.find("form", {"name": "cbi"})
+    if not form:
+        print("❌ Formular für neue SMS wurde nicht gefunden.")
+        return False
+
+    fields = {}
+    for field in form.find_all(["input", "textarea", "select"]):
+        name = field.get("name")
+        if not name:
+            continue
+        field_type = (field.get("type") or "").lower()
+        if field_type in ("submit", "button", "reset", "file"):
+            continue
+        if field.name == "select":
+            selected = field.find("option", selected=True) or field.find("option")
+            fields[name] = selected.get("value", "") if selected else ""
+        else:
+            fields[name] = field.get("value", "") if field.name == "input" else field.get_text()
+
+    phone_names = [name for name in fields if any(token in name.lower() for token in ("phone", "number", "recipient", "receiver", ".to"))]
+    text_names = [name for name in fields if any(token in name.lower() for token in ("content", "message", "text", ".msg"))]
+    if len(phone_names) != 1 or len(text_names) != 1 or phone_names[0] == text_names[0]:
+        print("❌ Empfänger- und Textfelder im SMS-Formular sind nicht eindeutig erkennbar.")
+        return False
+
+    fields[phone_names[0]] = empfaenger
+    fields[text_names[0]] = nachricht
+    if "cbi.submit" in {item.get("name") for item in form.find_all("input")}:
+        fields["cbi.submit"] = "1"
+
+    action = form.get("action")
+    if not action:
+        print("❌ Formularziel für neue SMS fehlt.")
+        return False
+    action_url = urljoin(form_response.url, action)
+    headers = {**HEADERS, "Referer": form_response.url}
+    result = session.post(action_url, data=fields, headers=headers, timeout=REQUEST_TIMEOUT)
+    if result.status_code == 403:
+        raise PermissionError("Cudy Session beim manuellen SMS-Versand abgelaufen.")
+    if result.status_code not in (200, 302):
+        print("❌ Cudy hat die neue SMS nicht angenommen:", result.status_code)
+        return False
+    print("📤 SMS wurde an den Router übermittelt.")
+    return True
 
 
 # ============================================================
@@ -1210,7 +1280,7 @@ def verarbeite_sms_liste(
             )
         )
 
-        if sms["phone"] != LIDL_ABSENDER:
+        if sms["phone"] and sms["phone"] != LIDL_ABSENDER:
             continue
 
         # ====================================================
@@ -1450,12 +1520,11 @@ def finde_cfg_fuer_sms(
         html
     )
 
+    passende_sms = []
+
     for gespeicherte_sms in sms_liste:
 
-        if (
-            gespeicherte_sms["phone"]
-            != sms["phone"]
-        ):
+        if sms["phone"] and gespeicherte_sms["phone"] != sms["phone"]:
             continue
 
         if (
@@ -1470,11 +1539,12 @@ def finde_cfg_fuer_sms(
         ):
             continue
 
-        return gespeicherte_sms[
-            "cfg"
-        ]
+        passende_sms.append(gespeicherte_sms)
 
-    return None
+    if len(passende_sms) != 1:
+        return None
+
+    return passende_sms[0]["cfg"]
 
 
 # ============================================================
@@ -2966,7 +3036,7 @@ class CudyGUI:
 
         self.test_refill_button = ttk.Button(
             tab,
-            text="🧪 Test Refill",
+            text="🚨 Manueller Notfall-Refill senden",
             command=self.test_refill
         )
 
@@ -3599,17 +3669,38 @@ class CudyGUI:
     # ========================================================
 
     def test_refill(self):
+        if not messagebox.askyesno(
+            "Notfall-Refill senden?",
+            f"Jetzt '{REFILL_TEXT}' per SMS an {LIDL_ABSENDER} senden?\n\n"
+            "Dadurch kann beim Mobilfunkanbieter ein Refill ausgelöst werden.",
+            parent=self.root
+        ):
+            return
 
-        print()
-        print(
-            "🧪 TEST REFILL"
-        )
+        self.test_refill_button.config(state="disabled")
 
-        print(
-            "⚠️ Der manuelle Test-Refill "
-            "wird als nächster Backend-Schritt "
-            "sicher eingebaut."
-        )
+        def worker():
+            try:
+                with REFILL_SEND_LOCK:
+                    if not login():
+                        return
+                    vorher = outbox_snapshot()
+                    if not sende_neue_sms(LIDL_ABSENDER, REFILL_TEXT):
+                        return
+                    time.sleep(3)
+                    nachher = outbox_snapshot()
+
+                if nachher - vorher:
+                    gui_status("letzter_refill", time.strftime("%H:%M:%S"))
+                    print("✅ Manueller Refill in der Outbox bestätigt.")
+                else:
+                    print("⚠️ SMS an Router übermittelt, aber kein neuer Refill in der Outbox bestätigt.")
+            except Exception as exc:
+                print("❌ Manueller Refill fehlgeschlagen:", exc)
+            finally:
+                self.root.after(0, lambda: self.test_refill_button.config(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ========================================================
     # BÄNDER

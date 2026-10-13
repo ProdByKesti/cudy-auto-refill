@@ -5,7 +5,9 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 ## Current features
 
 - Router login using the Cudy LuCI web interface
-- Incoming SMS polling and trigger matching for sender `80808`
+- Incoming SMS polling and trigger matching for sender `80808`, including the Lidl Connect Unlimited 1 GB used-up message
+- Sender fallback for trigger SMS whose number is missing in the inbox list, with sender verification before replying
+- Manual emergency `Refill` SMS to `80808`, with confirmation and outbox verification
 - Refill reply verification by checking for a new matching item in the outbox
 - Per-SMS attempt tracking in a local JSON state file
 - Inbox and outbox cleanup when configured message-count thresholds are reached
@@ -54,7 +56,7 @@ The program only starts monitoring after you press Start in the GUI. It can send
 
 - Polling for refill triggers reads the first inbox page.
 - Signal reading and LTE band management are not connected to the router API yet.
-- The manual test-refill button is a placeholder.
+- Manual sending uses the router’s `New Message` page and has not been live-tested on the user’s router.
 - Polling and watchdog settings apply at runtime and are not persisted between launches.
 
 The original version's working behavior was reported by the project owner. The new working copy has not been live-tested yet.
