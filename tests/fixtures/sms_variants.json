@@ -1,0 +1,29 @@
+{
+  "source_note": "Sanitized fixture data based on the user-provided Lidl Connect wording. Router row IDs and CFG values are synthetic; the fast-consumed body keeps only its observed trigger fragment.",
+  "messages": [
+    {
+      "case": "fast_consumed",
+      "sender": "80808",
+      "content": "Deine Unlimited-1GB Option ist fast verbraucht.",
+      "preview": "Deine Unlimited-1GB Option...",
+      "timestamp": "FIXTURE_FAST_01",
+      "cfg": "fixture-cfg-fast"
+    },
+    {
+      "case": "depleted_missing_sender",
+      "sender": "",
+      "content": "  Deine Unlimited-1GB Option ist jetzt verbraucht. Buche sofort ein weiteres, kostenloses GB über die Lidl Connect App, um die aktuelle Reduzierung der Surfgeschwindigkeit aufzuheben. Bestätige hierzu den Refill-Button innerhalb der App, oder antworte einfach auf diese SMS mit Refill. Dein Lidl Connect Team.  ",
+      "preview": "Deine Unlimited-1GB Option ist jetzt verbraucht...",
+      "timestamp": "FIXTURE_DEPLETED_01",
+      "cfg": "fixture-cfg-depleted"
+    },
+    {
+      "case": "outbox_refill_old",
+      "sender": "80808",
+      "content": "Refill",
+      "preview": "Refill",
+      "timestamp": "FIXTURE_OUTBOX_OLD",
+      "cfg": "fixture-cfg-outbox-old"
+    }
+  ]
+}

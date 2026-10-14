@@ -10,6 +10,7 @@ import threading
 import queue
 import logging
 import re
+import unicodedata
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from tkinter import ttk, messagebox
@@ -81,7 +82,7 @@ def speichere_app_einstellungen(value):
         os.replace(temporary, SETTINGS_FILE)
         return True
     except OSError as exc:
-        print("⚠️ Einstellungen konnten nicht gespeichert werden:", exc)
+        print("Einstellungen konnten nicht gespeichert werden:", exc)
         return False
 
 
@@ -153,7 +154,7 @@ def lade_router_passwort():
     except FileNotFoundError:
         pass
     except (OSError, ValueError, UnicodeDecodeError):
-        print("⚠️ Geschütztes Router-Passwort konnte nicht gelesen werden.")
+        print("Geschütztes Router-Passwort konnte nicht gelesen werden.")
 
     for path in LEGACY_CREDENTIAL_FILES:
         try:
@@ -170,11 +171,11 @@ def lade_router_passwort():
             try:
                 speichere_router_passwort(passwort)
                 print(
-                    "🔐 Router-Passwort in Windows DPAPI übernommen. "
+                    "Router-Passwort in Windows DPAPI übernommen. "
                     "Die alte JSON-Datei bleibt zur manuellen Entfernung erhalten."
                 )
             except (OSError, ValueError):
-                print("⚠️ Router-Passwort konnte nicht mit Windows DPAPI geschützt werden.")
+                print("Router-Passwort konnte nicht mit Windows DPAPI geschützt werden.")
         return passwort
     return ""
 
@@ -199,7 +200,7 @@ def speichere_lte_profil(value):
             json.dump(value, f, ensure_ascii=False, indent=2)
         os.replace(temporary, LTE_PROFILE_FILE)
     except OSError as exc:
-        print("⚠️ LTE-Profil konnte nicht gespeichert werden:", exc)
+        print("LTE-Profil konnte nicht gespeichert werden:", exc)
 
 
 # Polling
@@ -233,6 +234,28 @@ REFILL_TRIGGERS = [
     "option aufgebraucht",
 ]
 
+
+def normalisiere_sms_text(text):
+    """Normalize SMS text before matching router-rendered content."""
+    text = unicodedata.normalize("NFKC", str(text or ""))
+    text = re.sub(r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.casefold().strip()
+
+
+def ist_refill_trigger(text):
+    normalized = normalisiere_sms_text(text)
+    if any(normalisiere_sms_text(trigger) in normalized for trigger in REFILL_TRIGGERS):
+        return True
+
+    # Lidl Connect varies the wording of the exhausted Unlimited-1GB notice.
+    return (
+        "unlimited" in normalized
+        and "option" in normalized
+        and re.search(r"\bverbrauch\w*", normalized) is not None
+    )
+
+
 REFILL_TEXT = "Refill"
 REFILL_SEND_LOCK = threading.Lock()
 
@@ -265,7 +288,8 @@ status_data = {
     "letzter_refill": "-",
     "cleanup": "-",
     "watchdog": "Aktiv",
-    "letzter_poll": "-"
+    "letzter_poll": "-",
+    "fehler": ""
 }
 
 
@@ -368,6 +392,58 @@ def gui_status(name, value):
     )
 
 
+FEHLER_PHASEN = {
+    "login": "Router-Login",
+    "poll": "Inbox-Polling",
+    "outbox": "Refill-Bestätigung",
+}
+AKTIVE_FEHLER = {}
+AKTIVE_FEHLER_TYPEN = {}
+AKTIVE_FEHLER_LOCK = threading.Lock()
+
+
+def _fehlertext_locked():
+    return "\n".join(
+        f"{FEHLER_PHASEN[phase]}: {AKTIVE_FEHLER[phase]}"
+        for phase in FEHLER_PHASEN
+        if phase in AKTIVE_FEHLER
+    )
+
+
+def melde_fehler(phase, message, art=None):
+    if phase not in FEHLER_PHASEN:
+        return False
+
+    with AKTIVE_FEHLER_LOCK:
+        vorherige_meldung = AKTIVE_FEHLER.get(phase)
+        vorherige_art = AKTIVE_FEHLER_TYPEN.get(phase)
+        if vorherige_meldung == message and (art is None or vorherige_art == art):
+            return False
+
+        AKTIVE_FEHLER[phase] = message
+        if art is not None:
+            AKTIVE_FEHLER_TYPEN[phase] = art
+        text = _fehlertext_locked()
+
+    gui_status("fehler", text)
+    return True
+
+
+def bereinige_fehler(phase, nur_art=None):
+    with AKTIVE_FEHLER_LOCK:
+        if phase not in AKTIVE_FEHLER:
+            return False
+        if nur_art is not None and AKTIVE_FEHLER_TYPEN.get(phase) != nur_art:
+            return False
+
+        del AKTIVE_FEHLER[phase]
+        AKTIVE_FEHLER_TYPEN.pop(phase, None)
+        text = _fehlertext_locked()
+
+    gui_status("fehler", text)
+    return True
+
+
 # ============================================================
 # HILFSFUNKTIONEN
 # ============================================================
@@ -413,7 +489,7 @@ def hole_token():
 
     token = response.text.strip()
 
-    print("🔑 Router-Token erhalten.")
+    print("Router-Token erhalten.")
 
     return token
 
@@ -421,13 +497,15 @@ def hole_token():
 def login():
     global PASSWORT
     print()
-    print("🔐 Starte Cudy Login...")
+    print("Starte Cudy Login...")
 
     if not PASSWORT:
         PASSWORT = lade_router_passwort()
     if not PASSWORT:
-        print("❌ Router-Passwort fehlt. Lege es in cudy_credentials.json oder CUDY_ROUTER_PASSWORD ab.")
+        print("Router-Passwort fehlt. Lege es in cudy_credentials.json oder CUDY_ROUTER_PASSWORD ab.")
         gui_status("router", "Passwort fehlt")
+        gui_status("status", "Login-Fehler")
+        melde_fehler("login", "Router-Passwort fehlt. Bitte in den Einstellungen hinterlegen.")
         return False
     gui_status(
         "router",
@@ -502,7 +580,7 @@ def login():
         )
 
         if sms_page.status_code == 200 and not login_form:
-            print("🟢 LOGIN ERFOLGREICH! (geschützte Router-Seite bestätigt)")
+            print("LOGIN ERFOLGREICH! (geschützte Router-Seite bestätigt)")
 
             gui_status(
                 "router",
@@ -513,6 +591,7 @@ def login():
                 "status",
                 "Aktiv"
             )
+            bereinige_fehler("login")
 
             return True
 
@@ -522,19 +601,21 @@ def login():
             else f"geschützte Seite antwortet mit HTTP {sms_page.status_code}"
         )
         print(
-            f"🔴 LOGIN FEHLGESCHLAGEN: POST HTTP {login_response.status_code}; {grund}."
+            f"LOGIN FEHLGESCHLAGEN: POST HTTP {login_response.status_code}; {grund}."
         )
 
         gui_status(
             "router",
             "Login fehlgeschlagen"
         )
+        gui_status("status", "Login-Fehler")
+        melde_fehler("login", "Anmeldung am Router fehlgeschlagen; automatische Wiederholungen laufen.")
 
         return False
 
     except requests.exceptions.RequestException as e:
         print(
-            "🔴 LOGIN-NETZWERKFEHLER:",
+            "LOGIN-NETZWERKFEHLER:",
             e
         )
 
@@ -542,12 +623,14 @@ def login():
             "router",
             "Netzwerkfehler"
         )
+        gui_status("status", "Login-Fehler")
+        melde_fehler("login", "Router ist beim Login nicht erreichbar; automatische Wiederholungen laufen.")
 
         return False
 
     except Exception as e:
         print(
-            "🔴 LOGIN-FEHLER:",
+            "LOGIN-FEHLER:",
             e
         )
 
@@ -555,6 +638,8 @@ def login():
             "router",
             "Fehler"
         )
+        gui_status("status", "Login-Fehler")
+        melde_fehler("login", "Router-Login ist fehlgeschlagen; automatische Wiederholungen laufen.")
 
         return False
 
@@ -676,7 +761,7 @@ def hole_alle_sms_seiten(
     )
 
     print(
-        f"   📄 {smsbox.upper()}: "
+        f"   {smsbox.upper()}: "
         f"{letzte_seite} Seite(n)"
     )
 
@@ -699,7 +784,7 @@ def hole_alle_sms_seiten(
 
         except Exception as e:
             print(
-                f"⚠️ Seite {page} konnte "
+                f"Seite {page} konnte "
                 f"nicht geladen werden:",
                 e
             )
@@ -710,6 +795,28 @@ def hole_alle_sms_seiten(
 # ============================================================
 # SMS AUS HTML PARSEN
 # ============================================================
+
+def sms_element_text(element):
+    """Prefer the longest visible or tooltip text available in a table cell."""
+    if not element:
+        return ""
+
+    candidates = [element.get_text(" ", strip=True)]
+    for node in [element, *element.find_all(True)]:
+        for attribute in (
+            "title",
+            "aria-label",
+            "data-content",
+            "data-original-title",
+            "data-fulltext",
+            "data-full-text",
+        ):
+            value = node.get(attribute)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+
+    return max(candidates, key=len, default="")
+
 
 def lese_sms(html):
     soup = BeautifulSoup(
@@ -767,9 +874,7 @@ def lese_sms(html):
                 phone.get_text(strip=True) if phone else "",
 
             "content":
-                content.get_text(
-                    strip=True
-                ),
+                sms_element_text(content_element),
 
             "timestamp":
                 timestamp.get_text(
@@ -852,9 +957,7 @@ def lese_sms_mit_cfg(html):
 
         phone_text = phone.get_text(strip=True) if phone else ""
 
-        content_text = content.get_text(
-            strip=True
-        )
+        content_text = sms_element_text(content_element)
 
         timestamp_text = timestamp.get_text(
             strip=True
@@ -988,9 +1091,9 @@ def lade_sms_state():
         try:
             os.makedirs(APP_DATA_DIR, exist_ok=True)
             shutil.copy2(LEGACY_SMS_STATE_FILE, SMS_STATE_FILE)
-            print("📁 Vorhandene SMS-States ins Windows-Benutzerprofil übernommen.")
+            print("Vorhandene SMS-States ins Windows-Benutzerprofil übernommen.")
         except OSError as exc:
-            print("⚠️ SMS-States konnten nicht übernommen werden:", exc)
+            print("SMS-States konnten nicht übernommen werden:", exc)
 
     if not os.path.exists(
         SMS_STATE_FILE
@@ -1019,7 +1122,7 @@ def lade_sms_state():
     except Exception as e:
 
         print(
-            "⚠️ sms_state.json konnte "
+            "sms_state.json konnte "
             "nicht gelesen werden:",
             e
         )
@@ -1058,6 +1161,120 @@ def speichere_sms_state(state):
 # OUTBOX SNAPSHOT
 # ============================================================
 
+OUTBOX_CONFIRMATION_DELAYS = (2, 4, 6)
+OUTBOX_PENDING_CHECK_INTERVAL = 30
+OUTBOX_PENDING_TIMEOUT = 300
+OUTBOX_PENDING_BASELINE = None
+OUTBOX_PENDING_EXPIRES_AT = 0.0
+OUTBOX_PENDING_NEXT_CHECK = 0.0
+OUTBOX_PENDING_LOCK = threading.Lock()
+
+
+class OutboxSnapshotError(Exception):
+    """The Outbox baseline could not be read before attempting a refill."""
+
+
+def merke_ausstehende_outbox_bestaetigung(baseline):
+    global OUTBOX_PENDING_BASELINE
+    global OUTBOX_PENDING_EXPIRES_AT
+    global OUTBOX_PENDING_NEXT_CHECK
+
+    with OUTBOX_PENDING_LOCK:
+        OUTBOX_PENDING_BASELINE = set(baseline)
+        OUTBOX_PENDING_EXPIRES_AT = time.monotonic() + OUTBOX_PENDING_TIMEOUT
+        OUTBOX_PENDING_NEXT_CHECK = time.monotonic() + OUTBOX_PENDING_CHECK_INTERVAL
+
+
+def pruefe_ausstehende_outbox_bestaetigung(snapshot):
+    global OUTBOX_PENDING_BASELINE
+    global OUTBOX_PENDING_EXPIRES_AT
+    global OUTBOX_PENDING_NEXT_CHECK
+
+    with OUTBOX_PENDING_LOCK:
+        if OUTBOX_PENDING_BASELINE is None:
+            return False
+
+        if time.monotonic() >= OUTBOX_PENDING_EXPIRES_AT:
+            OUTBOX_PENDING_BASELINE = None
+            OUTBOX_PENDING_EXPIRES_AT = 0.0
+            OUTBOX_PENDING_NEXT_CHECK = 0.0
+            return False
+
+        neue_eintraege = snapshot - OUTBOX_PENDING_BASELINE
+        if not neue_eintraege:
+            print(
+                "Outbox-Bestätigung offen: "
+                f"passende Refill-Einträge={len(snapshot)}, neue=0."
+            )
+            return False
+
+        OUTBOX_PENDING_BASELINE = None
+        OUTBOX_PENDING_EXPIRES_AT = 0.0
+        OUTBOX_PENDING_NEXT_CHECK = 0.0
+
+    gui_status("letzter_refill", time.strftime("%H:%M:%S"))
+    bereinige_fehler("outbox", nur_art="confirmation")
+    print("Verzögerte Refill-Bestätigung in der Outbox erkannt.")
+    return True
+
+
+def pruefe_offene_outbox_bestaetigung():
+    global OUTBOX_PENDING_BASELINE
+    global OUTBOX_PENDING_EXPIRES_AT
+    global OUTBOX_PENDING_NEXT_CHECK
+
+    with OUTBOX_PENDING_LOCK:
+        if OUTBOX_PENDING_BASELINE is None:
+            return
+
+        jetzt = time.monotonic()
+        if jetzt >= OUTBOX_PENDING_EXPIRES_AT:
+            OUTBOX_PENDING_BASELINE = None
+            OUTBOX_PENDING_EXPIRES_AT = 0.0
+            OUTBOX_PENDING_NEXT_CHECK = 0.0
+            return
+
+        if jetzt < OUTBOX_PENDING_NEXT_CHECK:
+            return
+
+        OUTBOX_PENDING_NEXT_CHECK = jetzt + OUTBOX_PENDING_CHECK_INTERVAL
+
+    try:
+        with REFILL_SEND_LOCK:
+            outbox_snapshot()
+    except Exception:
+        # Keep the alert and retry at the next bounded check interval.
+        return
+
+
+def warte_auf_outbox_bestaetigung(baseline):
+    snapshot_fehler = False
+
+    for wartezeit in OUTBOX_CONFIRMATION_DELAYS:
+        time.sleep(wartezeit)
+        try:
+            snapshot = outbox_snapshot()
+        except Exception:
+            snapshot_fehler = True
+            continue
+
+        if snapshot - baseline:
+            gui_status("letzter_refill", time.strftime("%H:%M:%S"))
+            bereinige_fehler("outbox", nur_art="confirmation")
+            return True
+
+    merke_ausstehende_outbox_bestaetigung(baseline)
+    meldung = (
+        "Die Outbox konnte nach dem Refill nicht geprüft werden; "
+        "die Bestätigung wird später erneut abgefragt."
+        if snapshot_fehler
+        else "Der Refill ist noch nicht in der Outbox bestätigt; "
+        "die Bestätigung wird später erneut abgefragt."
+    )
+    melde_fehler("outbox", meldung, art="confirmation")
+    return False
+
+
 def outbox_snapshot():
 
     seiten = hole_alle_sms_seiten(
@@ -1089,6 +1306,8 @@ def outbox_snapshot():
                 sms_id(sms)
             )
 
+    pruefe_ausstehende_outbox_bestaetigung(snapshot)
+    bereinige_fehler("outbox", nur_art="read")
     return snapshot
 
 
@@ -1102,7 +1321,7 @@ def sende_reply(
 ):
     print()
     print(
-        "📤 Starte SMS-Reply..."
+        "Starte SMS-Reply..."
     )
 
     print(
@@ -1150,7 +1369,7 @@ def sende_reply(
 
     if not form:
         print(
-            "❌ Reply-Formular nicht gefunden."
+            "Reply-Formular nicht gefunden."
         )
         return False
 
@@ -1160,7 +1379,7 @@ def sende_reply(
 
     if not action:
         print(
-            "❌ Formular-Action nicht gefunden."
+            "Formular-Action nicht gefunden."
         )
         return False
 
@@ -1204,7 +1423,7 @@ def sende_reply(
 
     empfaenger = phone_field.get("value", "").strip() if phone_field else ""
     if empfaenger != LIDL_ABSENDER:
-        print("❌ Reply abgebrochen: Absendernummer im Detailformular ist nicht eindeutig 80808.")
+        print("Reply abgebrochen: Absendernummer im Detailformular ist nicht eindeutig 80808.")
         return False
 
     daten[
@@ -1230,7 +1449,7 @@ def sende_reply(
     )
 
     print(
-        "📡 Sende Reply an Cudy..."
+        "Sende Reply an Cudy..."
     )
 
     send_response = session.post(
@@ -1261,7 +1480,7 @@ def sende_reply(
     ):
 
         print(
-            "❌ Cudy hat den Reply "
+            "Cudy hat den Reply "
             "nicht akzeptiert."
         )
 
@@ -1270,7 +1489,7 @@ def sende_reply(
     print()
 
     print(
-        "🟢 REPLY ERFOLGREICH AN CUDY ÜBERMITTELT!"
+        "Reply-Anfrage von Cudy angenommen; Outbox-Bestätigung steht noch aus."
     )
 
     return True
@@ -1280,77 +1499,53 @@ def sende_reply(
 # EINEN REFILL-VERSUCH
 # ============================================================
 
-def refill_versuch(
-    cfg,
-    outbox_vorher
-):
+def refill_versuch(cfg):
     print()
-
-    print(
-        "🔄 Starte EINEN Refill-Versuch..."
-    )
+    print("Starte EINEN Refill-Versuch...")
 
     with REFILL_SEND_LOCK:
-        erfolg = sende_reply(
-            cfg,
-            REFILL_TEXT
-        )
+        try:
+            outbox_vorher = outbox_snapshot()
+        except PermissionError:
+            raise
+        except Exception as e:
+            print("Outbox-Snapshot vor dem Refill fehlgeschlagen:", e)
+            melde_fehler(
+                "outbox",
+                "Die Outbox konnte vor dem Refill nicht gelesen werden; der Versand wurde abgebrochen.",
+                art="read",
+            )
+            raise OutboxSnapshotError from e
 
-    if not erfolg:
+        try:
+            erfolg = sende_reply(cfg, REFILL_TEXT)
+        except PermissionError:
+            raise
+        except Exception:
+            merke_ausstehende_outbox_bestaetigung(outbox_vorher)
+            melde_fehler(
+                "outbox",
+                "Der Refill-Versand ist unklar; die Outbox wird weiter auf eine Bestätigung geprüft.",
+                art="confirmation",
+            )
+            raise
+
+        if not erfolg:
+            melde_fehler(
+                "outbox",
+                "Refill-SMS wurde vom Router nicht als erfolgreich angenommen.",
+                art="confirmation",
+            )
+            return False
+
+        print("Warte auf Cudy-Verarbeitung...")
+        print("Prüfe Outbox auf neue Refill-SMS...")
+        if warte_auf_outbox_bestaetigung(outbox_vorher):
+            print("Neues Refill in der Outbox bestätigt.")
+            return True
+
+        print("Refill ist noch nicht in der Outbox bestätigt.")
         return False
-
-    print(
-        "⏳ Warte auf Cudy-Verarbeitung..."
-    )
-
-    time.sleep(3)
-
-    print(
-        "🔎 Prüfe Outbox auf NEUE Refill-SMS..."
-    )
-
-    try:
-
-        outbox_nachher = outbox_snapshot()
-
-    except Exception as e:
-
-        print(
-            "⚠️ Outbox konnte nach dem "
-            "Senden nicht geprüft werden:",
-            e
-        )
-
-        return False
-
-    neue_refills = (
-        outbox_nachher
-        - outbox_vorher
-    )
-
-    if neue_refills:
-
-        print()
-
-        print(
-            "✅ NEUES REFILL IN OUTBOX BESTÄTIGT!"
-        )
-
-        gui_status(
-            "letzter_refill",
-            time.strftime("%H:%M:%S")
-        )
-
-        return True
-
-    print()
-
-    print(
-        "⚠️ Kein neues Refill in der Outbox gefunden."
-    )
-
-    return False
-
 
 def router_session_sicherstellen():
     """Reuse the current login; renew it only when the router rejects it."""
@@ -1361,9 +1556,9 @@ def router_session_sicherstellen():
     )
 
     if response.status_code == 403 or login_form:
-        print("🔐 Router-Session abgelaufen; erneuere Login einmalig.")
+        print("Router-Session abgelaufen; erneuere Login einmalig.")
         if not login():
-            print("❌ Manueller Refill fehlgeschlagen: Router-Login fehlgeschlagen.")
+            print("Manueller Refill fehlgeschlagen: Router-Login fehlgeschlagen.")
             return False
         response = session.get(sms_page_url, timeout=REQUEST_TIMEOUT)
         login_form = BeautifulSoup(response.text, "html.parser").find(
@@ -1371,7 +1566,8 @@ def router_session_sicherstellen():
         )
 
     if response.status_code == 403 or login_form:
-        print("❌ Manueller Refill fehlgeschlagen: Router-Session nicht verfügbar.")
+        print("Manueller Refill fehlgeschlagen: Router-Session nicht verfügbar.")
+        melde_fehler("login", "Router-Sitzung konnte nicht wiederhergestellt werden.")
         return False
 
     response.raise_for_status()
@@ -1408,7 +1604,7 @@ def sende_neue_sms(empfaenger, nachricht):
             break
 
     if not form:
-        print("❌ smsnew-Seite enthält das erwartete Empfänger- und Nachrichtenfeld nicht.")
+        print("smsnew-Seite enthält das erwartete Empfänger- und Nachrichtenfeld nicht.")
         return False
 
     fields = {}
@@ -1428,7 +1624,7 @@ def sende_neue_sms(empfaenger, nachricht):
     phone_names = [name for name in fields if any(token in name.lower() for token in ("phone", "number", "recipient", "receiver", ".to"))]
     text_names = [name for name in fields if any(token in name.lower() for token in ("content", "message", "text", ".msg"))]
     if len(phone_names) != 1 or len(text_names) != 1 or phone_names[0] == text_names[0]:
-        print("❌ Empfänger- und Textfelder im SMS-Formular sind nicht eindeutig erkennbar.")
+        print("Empfänger- und Textfelder im SMS-Formular sind nicht eindeutig erkennbar.")
         return False
 
     fields[phone_names[0]] = empfaenger
@@ -1453,7 +1649,7 @@ def sende_neue_sms(empfaenger, nachricht):
 
     action = form.get("action")
     if not action:
-        print("❌ Formularziel für neue SMS fehlt.")
+        print("Formularziel für neue SMS fehlt.")
         return False
     action_url = urljoin(form_response.url, action)
     headers = {**HEADERS, "Referer": form_response.url}
@@ -1461,9 +1657,9 @@ def sende_neue_sms(empfaenger, nachricht):
     if result.status_code == 403:
         raise PermissionError("Cudy Session beim manuellen SMS-Versand abgelaufen.")
     if result.status_code not in (200, 302):
-        print("❌ Cudy hat die neue SMS nicht angenommen:", result.status_code)
+        print("Cudy hat die neue SMS nicht angenommen:", result.status_code)
         return False
-    print("📤 SMS wurde an den Router übermittelt.")
+    print("SMS wurde an den Router übermittelt.")
     return True
 
 
@@ -1531,7 +1727,7 @@ def verarbeite_sms_liste(
     print()
 
     print(
-        "🧠 Gespeicherte SMS-States:",
+        "Gespeicherte SMS-States:",
         len(state)
     )
 
@@ -1553,12 +1749,7 @@ def verarbeite_sms_liste(
         # NEUER REFILL-TRIGGER-POOL
         # ====================================================
 
-        sms_text = sms["content"].lower()
-
-        trigger_gefunden = any(
-            trigger in sms_text
-            for trigger in REFILL_TRIGGERS
-        )
+        trigger_gefunden = ist_refill_trigger(sms["content"])
 
         if not trigger_gefunden:
             continue
@@ -1570,7 +1761,7 @@ def verarbeite_sms_liste(
         print()
 
         print(
-            "🚨 REFILL-SMS ERKANNT!"
+            "REFILL-SMS ERKANNT!"
         )
 
         print(
@@ -1589,24 +1780,24 @@ def verarbeite_sms_liste(
         )
 
         print(
-            "   👀 Read Count:",
+            "   Read Count:",
             eintrag["read_count"]
         )
 
         print(
-            "   🔄 Refill Attempts:",
+            "   Refill Attempts:",
             eintrag["refill_attempts"]
         )
 
         print(
-            "   ✅ Refill Success:",
+            "   Refill Success:",
             eintrag["refill_success"]
         )
 
         if eintrag["refill_success"]:
 
             print(
-                "   ⏭️ Refill bereits bestätigt."
+                "   Refill bereits bestätigt."
             )
 
             continue
@@ -1614,14 +1805,14 @@ def verarbeite_sms_liste(
         if eintrag["read_count"] > 2:
 
             print(
-                "   ⚠️ SMS wurde bereits "
+                "   SMS wurde bereits "
                 "mehrfach geprüft."
             )
 
             if eintrag["refill_attempts"] >= 2:
 
                 print(
-                    "   ⏭️ Maximale Refill-Versuche erreicht."
+                    "   Maximale Refill-Versuche erreicht."
                 )
 
             continue
@@ -1629,7 +1820,7 @@ def verarbeite_sms_liste(
         if eintrag["refill_attempts"] >= 2:
 
             print(
-                "   ⚠️ Bereits 2 Refill-Versuche."
+                "   Bereits 2 Refill-Versuche."
             )
 
             continue
@@ -1644,7 +1835,7 @@ def verarbeite_sms_liste(
             print()
 
             print(
-                "❌ CFG NICHT GEFUNDEN!"
+                "CFG NICHT GEFUNDEN!"
             )
 
             print(
@@ -1655,24 +1846,9 @@ def verarbeite_sms_liste(
             continue
 
         print(
-            "   🔎 SMS cfg:",
+            "   SMS cfg:",
             cfg
         )
-
-        try:
-
-            outbox_vorher = outbox_snapshot()
-
-        except Exception as e:
-
-            print()
-
-            print(
-                "⚠️ Outbox-Snapshot fehlgeschlagen:",
-                e
-            )
-
-            continue
 
         eintrag[
             "refill_attempts"
@@ -1688,17 +1864,26 @@ def verarbeite_sms_liste(
 
         try:
 
-            erfolg = refill_versuch(
-                cfg,
-                outbox_vorher
+            erfolg = refill_versuch(cfg)
+
+        except OutboxSnapshotError:
+
+            eintrag[
+                "refill_attempts"
+            ] -= 1
+
+            speichere_sms_state(
+                state
             )
+
+            continue
 
         except PermissionError:
 
             print()
 
             print(
-                "🔐 Session während Refill abgelaufen."
+                "Session während Refill abgelaufen."
             )
 
             eintrag[
@@ -1716,8 +1901,13 @@ def verarbeite_sms_liste(
             print()
 
             print(
-                "❌ FEHLER BEIM REFILL:",
+                "FEHLER BEIM REFILL:",
                 e
+            )
+            melde_fehler(
+                "outbox",
+                "Refill-Versand oder Outbox-Bestätigung ist fehlgeschlagen.",
+                art="confirmation",
             )
 
             erfolg = False
@@ -1735,7 +1925,7 @@ def verarbeite_sms_liste(
             print()
 
             print(
-                "🎉🎉🎉 REFILL ERFOLGREICH! 🎉🎉🎉"
+                "REFILL ERFOLGREICH!"
             )
 
         else:
@@ -1743,7 +1933,7 @@ def verarbeite_sms_liste(
             print()
 
             print(
-                "❌ REFILL NICHT BESTÄTIGT."
+                "REFILL NICHT BESTÄTIGT."
             )
 
             if (
@@ -1752,14 +1942,14 @@ def verarbeite_sms_liste(
             ):
 
                 print(
-                    "   🔁 Bei der nächsten "
+                    "   Bei der nächsten "
                     "Prüfung erfolgt Versuch #2."
                 )
 
             else:
 
                 print(
-                    "   ⚠️ Keine weiteren Versuche "
+                    "   Keine weiteren Versuche "
                     "für diese SMS."
                 )
 
@@ -1853,14 +2043,14 @@ def loesche_sms(
         if response.status_code != 200:
 
             print(
-                "❌ Löschen fehlgeschlagen:",
+                "Löschen fehlgeschlagen:",
                 response.status_code
             )
 
             return False
 
         print(
-            "   🗑️ Gelöscht:",
+            "   Gelöscht:",
             cfg
         )
 
@@ -1872,7 +2062,7 @@ def loesche_sms(
     except Exception as e:
 
         print(
-            "❌ Löschfehler:",
+            "Löschfehler:",
             e
         )
 
@@ -1938,7 +2128,7 @@ def cleanup_smsbox(
     print()
 
     print(
-        f"🧹 Prüfe "
+        f"Prüfe "
         f"{'INBOX' if smsbox == 'rec' else 'OUTBOX'}..."
     )
 
@@ -1951,7 +2141,7 @@ def cleanup_smsbox(
     )
 
     print(
-        "   📨 SMS:",
+        "   SMS:",
         anzahl
     )
 
@@ -1965,7 +2155,7 @@ def cleanup_smsbox(
     if anzahl < start_limit:
 
         print(
-            f"   ✅ Unter Grenzwert "
+            f"   Unter Grenzwert "
             f"{start_limit}."
         )
 
@@ -1977,11 +2167,11 @@ def cleanup_smsbox(
     )
 
     print(
-        "   ⚠️ Speichergrenze erreicht."
+        "   Speichergrenze erreicht."
     )
 
     print(
-        f"   🗑️ Ziel: "
+        f"   Ziel: "
         f"{target_limit} SMS."
     )
 
@@ -1998,7 +2188,7 @@ def cleanup_smsbox(
         if identifikation in geschützte_sms:
 
             print(
-                "   🛡️ Geschützt:",
+                "   Geschützt:",
                 sms["timestamp"]
             )
 
@@ -2014,7 +2204,7 @@ def cleanup_smsbox(
     if not kandidaten:
 
         print(
-            "   ⚠️ Keine löschbaren SMS gefunden."
+            "   Keine löschbaren SMS gefunden."
         )
 
         return
@@ -2026,7 +2216,7 @@ def cleanup_smsbox(
         print()
 
         print(
-            "🗑️ Cleanup:"
+            "Cleanup:"
         )
 
         print(
@@ -2063,7 +2253,7 @@ def cleanup_smsbox(
     print()
 
     print(
-        f"🟢 Cleanup abgeschlossen. "
+        f"Cleanup abgeschlossen. "
         f"{gelöscht} SMS gelöscht."
     )
 
@@ -2100,7 +2290,7 @@ def cleanup(
         print()
 
         print(
-            "🔐 Session beim Cleanup abgelaufen."
+            "Session beim Cleanup abgelaufen."
         )
 
         raise
@@ -2108,7 +2298,7 @@ def cleanup(
     except Exception as e:
 
         print(
-            "⚠️ Cleanup-Fehler:",
+            "Cleanup-Fehler:",
             e
         )
 
@@ -2132,6 +2322,7 @@ def poll():
     letzter_erfolgreicher_poll = (
         time.monotonic()
     )
+    bereinige_fehler("poll")
 
     gui_status(
         "letzter_poll",
@@ -2144,7 +2335,7 @@ def poll():
     )
 
     print(
-        f"📡 Poll OK | "
+        f"Poll OK | "
         f"Inbox Seite 1: {len(sms_liste)} SMS"
     )
 
@@ -2153,6 +2344,7 @@ def poll():
         html
     )
 
+    pruefe_offene_outbox_bestaetigung()
     return geschützte_sms
 
 
@@ -2170,7 +2362,7 @@ def session_recovery():
         return False
 
     print()
-    print("🔄 SESSION-RECOVERY...")
+    print("SESSION-RECOVERY...")
     gui_status("status", "Session-Recovery")
     session.cookies.clear()
 
@@ -2179,13 +2371,13 @@ def session_recovery():
         session_recovery_retry_delay = SESSION_RECOVERY_BASE_SECONDS
         letzter_session_refresh = time.monotonic()
         letzter_erfolgreicher_poll = time.monotonic()
-        print("🟢 Session-Recovery erfolgreich.")
+        print("Session-Recovery erfolgreich.")
         gui_status("status", "Aktiv")
         return True
 
-    print("🔴 Session-Recovery fehlgeschlagen.")
+    print("Session-Recovery fehlgeschlagen.")
     print(
-        f"⏳ Nächster Session-Recovery-Versuch in "
+        f"Nächster Session-Recovery-Versuch in "
         f"{session_recovery_retry_delay} Sekunden."
     )
     session_recovery_retry_at = time.monotonic() + session_recovery_retry_delay
@@ -2211,39 +2403,39 @@ def hauptschleife():
     )
 
     print(
-        "🚀 CUDY AUTO REFILL V4.1"
+        "CUDY AUTO REFILL V4.1"
     )
 
     print(
-        "🖥️ GUI MODUS"
+        "GUI MODUS"
     )
 
     print(
-        "🔄 DAUERBETRIEB AKTIV"
+        "DAUERBETRIEB AKTIV"
     )
 
     print(
-        f"⏱️ Poll: "
+        f"Poll: "
         f"{POLL_INTERVAL}s"
     )
 
     print(
-        f"🔄 Session-Refresh: "
+        f"Session-Refresh: "
         f"{('Aus' if SESSION_REFRESH_INTERVAL == 0 else f'{SESSION_REFRESH_INTERVAL / 60:g}min')}"
     )
 
     print(
-        f"🐕 Watchdog: "
+        f"Watchdog: "
         f"{WATCHDOG_TIMEOUT}s"
     )
 
     print(
-        "🧠 SMS-Prüfung: "
+        "SMS-Prüfung: "
         "max. 2 Beobachtungen / Refill-Versuche"
     )
 
     print(
-        "🎯 Refill-Trigger:"
+        "Refill-Trigger:"
     )
 
     for trigger in REFILL_TRIGGERS:
@@ -2252,13 +2444,13 @@ def hauptschleife():
         )
 
     print(
-        f"🧹 Inbox Cleanup: "
+        f"Inbox Cleanup: "
         f"{INBOX_CLEANUP_START} → "
         f"{INBOX_CLEANUP_TARGET}"
     )
 
     print(
-        f"🧹 Outbox Cleanup: "
+        f"Outbox Cleanup: "
         f"{OUTBOX_CLEANUP_START} → "
         f"{OUTBOX_CLEANUP_TARGET}"
     )
@@ -2282,9 +2474,9 @@ def hauptschleife():
             break
 
         print()
-        print("⏳ Login fehlgeschlagen.")
+        print("Login fehlgeschlagen.")
         print(
-            f"🔄 Neuer Versuch in {login_retry_delay} Sekunden "
+            f"Neuer Versuch in {login_retry_delay} Sekunden "
             f"(maximal {LOGIN_RETRY_MAX_SECONDS})."
         )
         for _ in range(login_retry_delay):
@@ -2329,7 +2521,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🔄 Regelmäßiger "
+                    "Regelmäßiger "
                     "Session-Refresh..."
                 )
 
@@ -2361,12 +2553,16 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🔐 SESSION ABGELAUFEN!"
+                    "SESSION ABGELAUFEN!"
                 )
 
                 gui_status(
                     "status",
                     "Session abgelaufen"
+                )
+                melde_fehler(
+                    "poll",
+                    "Inbox-Polling wurde durch eine abgelaufene Router-Sitzung unterbrochen; Wiederherstellung läuft.",
                 )
 
                 if session_recovery():
@@ -2384,7 +2580,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "⏰ REQUEST TIMEOUT!"
+                    "REQUEST TIMEOUT!"
                 )
 
                 print(
@@ -2405,7 +2601,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🔴 Netzwerkfehler:",
+                    "Netzwerkfehler:",
                     e
                 )
 
@@ -2427,7 +2623,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "❌ Poll-Fehler:",
+                    "Poll-Fehler:",
                     e
                 )
 
@@ -2443,6 +2639,16 @@ def hauptschleife():
                 )
 
             # =================================================
+            # ANHALTENDER INBOX-FEHLER
+            # =================================================
+
+            if poll_fehler >= MAX_POLL_FEHLER:
+                melde_fehler(
+                    "poll",
+                    f"Inbox-Polling ist seit mindestens {MAX_POLL_FEHLER} Versuchen fehlgeschlagen; automatische Wiederherstellung läuft.",
+                )
+
+            # =================================================
             # 3 FEHLER IN FOLGE
             # =================================================
 
@@ -2451,7 +2657,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🚨🚨🚨 WATCHDOG RECOVERY 🚨🚨🚨"
+                    "WATCHDOG RECOVERY"
                 )
 
                 print(
@@ -2470,7 +2676,7 @@ def hauptschleife():
                 else:
 
                     print(
-                        "⚠️ Recovery fehlgeschlagen."
+                        "Recovery fehlgeschlagen."
                     )
 
                     poll_fehler = 0
@@ -2493,11 +2699,11 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🐕 WATCHDOG!"
+                    "WATCHDOG!"
                 )
 
                 print(
-                    f"   ⚠️ Seit "
+                    f"   Seit "
                     f"{int(zeit_seit_poll)} Sekunden "
                     "kein erfolgreicher Poll."
                 )
@@ -2537,7 +2743,7 @@ def hauptschleife():
                 print()
 
                 print(
-                    "🔐 Cleanup benötigt "
+                    "Cleanup benötigt "
                     "neue Session."
                 )
 
@@ -2551,7 +2757,7 @@ def hauptschleife():
 
             if POLL_INTERVAL <= 0:
                 print(
-                    "💤 Automatischer Poll ist deaktiviert."
+                    "Automatischer Poll ist deaktiviert."
                 )
 
                 while programm_laeuft and POLL_INTERVAL <= 0:
@@ -2559,7 +2765,7 @@ def hauptschleife():
 
             else:
                 print(
-                    f"💤 Nächster Check in "
+                    f"Nächster Check in "
                     f"{POLL_INTERVAL} Sekunden..."
                 )
 
@@ -2575,17 +2781,21 @@ def hauptschleife():
             print()
 
             print(
-                "💥 KRITISCHER FEHLER:",
+                "KRITISCHER FEHLER:",
                 e
             )
 
             print(
-                "🔄 Programm bleibt aktiv."
+                "Programm bleibt aktiv."
             )
 
             gui_status(
                 "status",
                 "Kritischer Fehler"
+            )
+            melde_fehler(
+                "poll",
+                "Ein unerwarteter Fehler ist aufgetreten; die Überwachung versucht fortzufahren.",
             )
 
             for _ in range(5):
@@ -2680,7 +2890,7 @@ class CudyGUI:
 
         title = ttk.Label(
             header,
-            text="🚀 Cudy Auto Refill",
+            text="Cudy Auto Refill",
             font=(
                 "Segoe UI",
                 20,
@@ -2694,7 +2904,7 @@ class CudyGUI:
 
         self.status_label = ttk.Label(
             header,
-            text="● Gestoppt",
+            text="Gestoppt",
             font=(
                 "Segoe UI",
                 12,
@@ -2714,6 +2924,21 @@ class CudyGUI:
             self.root
         )
 
+        ttk.Style(self.root).configure(
+            "CudyError.TLabel",
+            foreground="#9c1c1c",
+            padding=8,
+        )
+        self.error_banner = ttk.Label(
+            self.root,
+            text="",
+            style="CudyError.TLabel",
+            wraplength=920,
+            justify="left",
+            anchor="w",
+        )
+        self._error_banner_visible = False
+
         # ----------------------------------------------------
         # START / STOP
         # ----------------------------------------------------
@@ -2730,7 +2955,7 @@ class CudyGUI:
 
         self.start_button = ttk.Button(
             button_frame,
-            text="▶️ Start",
+            text="Start",
             command=self.starten
         )
 
@@ -2741,7 +2966,7 @@ class CudyGUI:
 
         self.stop_button = ttk.Button(
             button_frame,
-            text="⏹ Stop",
+            text="Stop",
             command=self.stoppen,
             state="disabled"
         )
@@ -2768,7 +2993,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.uebersicht_tab,
-            text="🏠 Übersicht"
+            text="Übersicht"
         )
 
         self.baue_uebersicht()
@@ -2784,7 +3009,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.sms_tab,
-            text="💬 SMS"
+            text="SMS"
         )
 
         self.baue_sms_tab()
@@ -2800,7 +3025,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.refill_tab,
-            text="🔄 Refill"
+            text="Refill"
         )
 
         self.baue_refill_tab()
@@ -2816,7 +3041,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.signal_tab,
-            text="📡 Signal"
+            text="Signal"
         )
 
         self.baue_signal_tab()
@@ -2832,7 +3057,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.einstellungen_tab,
-            text="⚙️ Einstellungen"
+            text="Einstellungen"
         )
 
         self.baue_einstellungen_tab()
@@ -2848,7 +3073,7 @@ class CudyGUI:
 
         self.notebook.add(
             self.log_tab,
-            text="📜 Log"
+            text="Log"
         )
 
         self.baue_log_tab()
@@ -2893,13 +3118,13 @@ class CudyGUI:
         )
 
         karten = [
-            ("status", "⚙️ Status"),
-            ("router", "📡 Router"),
-            ("inbox", "📥 Inbox"),
-            ("letzter_refill", "⚡ Letzter Refill"),
-            ("cleanup", "🧹 Cleanup"),
-            ("watchdog", "🐕 Watchdog"),
-            ("letzter_poll", "🔄 Letzter Poll"),
+            ("status", "Status"),
+            ("router", "Router"),
+            ("inbox", "Inbox"),
+            ("letzter_refill", "Letzter Refill"),
+            ("cleanup", "Cleanup"),
+            ("watchdog", "Watchdog"),
+            ("letzter_poll", "Letzter Poll"),
         ]
 
         for spalte, (key, titel) in enumerate(karten):
@@ -2945,7 +3170,7 @@ class CudyGUI:
 
         system_frame = ttk.LabelFrame(
             tab,
-            text="ℹ️ System",
+            text="System",
             padding=15
         )
 
@@ -2998,7 +3223,7 @@ class CudyGUI:
 
         ttk.Label(
             tab,
-            text="💬 SMS-Verwaltung",
+            text="SMS-Verwaltung",
             font=(
                 "Segoe UI",
                 16,
@@ -3023,7 +3248,7 @@ class CudyGUI:
 
         inbox_frame = ttk.LabelFrame(
             box_frame,
-            text="📥 Inbox",
+            text="Inbox",
             padding=20
         )
 
@@ -3053,7 +3278,7 @@ class CudyGUI:
 
         outbox_frame = ttk.LabelFrame(
             box_frame,
-            text="📤 Outbox",
+            text="Outbox",
             padding=20
         )
 
@@ -3087,7 +3312,7 @@ class CudyGUI:
 
         info_frame = ttk.LabelFrame(
             tab,
-            text="🔎 Überwachung",
+            text="Überwachung",
             padding=15
         )
 
@@ -3140,7 +3365,7 @@ class CudyGUI:
 
         self.sms_refresh_button = ttk.Button(
             tab,
-            text="🔄 Aktualisieren",
+            text="Aktualisieren",
             command=self.sms_aktualisieren
         )
 
@@ -3159,7 +3384,7 @@ class CudyGUI:
 
         ttk.Label(
             tab,
-            text="🔄 Refill",
+            text="Refill",
             font=(
                 "Segoe UI",
                 16,
@@ -3176,7 +3401,7 @@ class CudyGUI:
 
         status_frame = ttk.LabelFrame(
             tab,
-            text="⚡ Letzter Refill",
+            text="Letzter Refill",
             padding=20
         )
 
@@ -3202,7 +3427,7 @@ class CudyGUI:
 
         config_frame = ttk.LabelFrame(
             tab,
-            text="🎯 Refill-Konfiguration",
+            text="Refill-Konfiguration",
             padding=15
         )
 
@@ -3262,7 +3487,7 @@ class CudyGUI:
 
         hinweis = ttk.LabelFrame(
             tab,
-            text="ℹ️ Automatik",
+            text="Automatik",
             padding=15
         )
 
@@ -3301,7 +3526,7 @@ class CudyGUI:
 
         self.test_refill_button = ttk.Button(
             tab,
-            text="🚨 Manueller Notfall-Refill senden",
+            text="Manueller Notfall-Refill senden",
             command=self.test_refill
         )
 
@@ -3320,7 +3545,7 @@ class CudyGUI:
 
         ttk.Label(
             tab,
-            text="📡 Signal & Netzwerk",
+            text="Signal & Netzwerk",
             font=(
                 "Segoe UI",
                 16,
@@ -3337,7 +3562,7 @@ class CudyGUI:
 
         signal_frame = ttk.LabelFrame(
             tab,
-            text="📶 LTE-Bandwahl (Routerkonfiguration)",
+            text="LTE-Bandwahl (Routerkonfiguration)",
             padding=20
         )
 
@@ -3363,7 +3588,7 @@ class CudyGUI:
 
         network_frame = ttk.LabelFrame(
             tab,
-            text="🌐 Netzwerk",
+            text="Netzwerk",
             padding=15
         )
 
@@ -3418,7 +3643,7 @@ class CudyGUI:
         # LTE-BANDWAHL UND SPEEDTEST
         # ----------------------------------------------------
 
-        band_frame = ttk.LabelFrame(tab, text="📶 LTE-Bandvergleich", padding=15)
+        band_frame = ttk.LabelFrame(tab, text="LTE-Bandvergleich", padding=15)
         band_frame.pack(fill="x", pady=(20, 0))
 
         ttk.Label(
@@ -3444,14 +3669,14 @@ class CudyGUI:
 
         self.signal_refresh_button = ttk.Button(
             buttons,
-            text="🔄 Bandwahl lesen",
+            text="Bandwahl lesen",
             command=self.signal_aktualisieren
         )
         self.signal_refresh_button.pack(side="left", padx=(0, 8))
 
         self.band_speedtest_button = ttk.Button(
             buttons,
-            text="🚀 Alle LTE-Bänder testen",
+            text="Alle LTE-Bänder testen",
             command=self.speedtest_alle_baender
         )
         self.band_speedtest_button.pack(side="left")
@@ -3497,7 +3722,7 @@ class CudyGUI:
 
         ttk.Label(
             tab,
-            text="⚙️ Einstellungen",
+            text="Einstellungen",
             font=(
                 "Segoe UI",
                 16,
@@ -3514,7 +3739,7 @@ class CudyGUI:
 
         router_frame = ttk.LabelFrame(
             tab,
-            text="📡 Router",
+            text="Router",
             padding=15
         )
 
@@ -3553,7 +3778,7 @@ class CudyGUI:
 
         sms_frame = ttk.LabelFrame(
             tab,
-            text="💬 SMS / Refill",
+            text="SMS / Refill",
             padding=15
         )
 
@@ -3608,7 +3833,7 @@ class CudyGUI:
 
         polling_frame = ttk.LabelFrame(
             tab,
-            text="⏱️ Überwachung",
+            text="Überwachung",
             padding=15
         )
 
@@ -3722,7 +3947,7 @@ class CudyGUI:
 
         band_frame = ttk.LabelFrame(
             tab,
-            text="📶 LTE-Bänder",
+            text="LTE-Bänder",
             padding=15
         )
 
@@ -3744,7 +3969,7 @@ class CudyGUI:
 
         self.band_button = ttk.Button(
             band_frame,
-            text="📶 Bänder verwalten",
+            text="Bänder verwalten",
             command=self.baender_verwalten
         )
 
@@ -3759,7 +3984,7 @@ class CudyGUI:
 
         self.settings_save_button = ttk.Button(
             tab,
-            text="💾 Einstellungen speichern",
+            text="Einstellungen speichern",
             command=self.einstellungen_speichern
         )
 
@@ -3791,7 +4016,7 @@ class CudyGUI:
 
         self.log_clear_button = ttk.Button(
             button_frame,
-            text="🗑️ Log löschen",
+            text="Log löschen",
             command=self.log_loeschen
         )
 
@@ -3800,7 +4025,7 @@ class CudyGUI:
         )
         self.log_copy_button = ttk.Button(
             button_frame,
-            text="📋 Diagnose kopieren",
+            text="Diagnose kopieren",
             command=self.diagnose_kopieren,
         )
         self.log_copy_button.pack(side="left", padx=(8, 0))
@@ -3897,7 +4122,7 @@ class CudyGUI:
         print()
 
         print(
-            "🛑 Stop angefordert..."
+            "Stop angefordert..."
         )
 
         programm_laeuft = False
@@ -3920,7 +4145,7 @@ class CudyGUI:
         if not programm_laeuft:
 
             print(
-                "⚠️ Programm muss laufen, "
+                "Programm muss laufen, "
                 "um SMS zu aktualisieren."
             )
 
@@ -3928,7 +4153,7 @@ class CudyGUI:
 
         print()
         print(
-            "🔄 Manuelle SMS-Aktualisierung..."
+            "Manuelle SMS-Aktualisierung..."
         )
 
         def worker():
@@ -3950,14 +4175,14 @@ class CudyGUI:
                 )
 
                 print(
-                    f"🟢 SMS-Aktualisierung: "
+                    f"SMS-Aktualisierung: "
                     f"{len(sms_liste)} SMS"
                 )
 
             except Exception as e:
 
                 print(
-                    "❌ SMS-Aktualisierung fehlgeschlagen:",
+                    "SMS-Aktualisierung fehlgeschlagen:",
                     e
                 )
 
@@ -4046,15 +4271,15 @@ class CudyGUI:
                 profile["letzter_bandtest"] = outcome
                 speichere_lte_profil(profile)
                 if outcome.get("restored"):
-                    print("✅ Vorherige LTE-Bandwahl wurde wiederhergestellt.")
+                    print("Vorherige LTE-Bandwahl wurde wiederhergestellt.")
                 else:
                     print(
-                        "❌ Vorherige LTE-Bandwahl konnte nicht wiederhergestellt werden:",
+                        "Vorherige LTE-Bandwahl konnte nicht wiederhergestellt werden:",
                         outcome.get("restore_error")
                     )
             except Exception as exc:
                 error = str(exc)
-                print("❌ LTE-Bandtest fehlgeschlagen:", exc)
+                print("LTE-Bandtest fehlgeschlagen:", exc)
 
             def finish():
                 self._band_test_running = False
@@ -4171,28 +4396,58 @@ class CudyGUI:
         self.test_refill_button.config(state="disabled")
 
         def worker():
-            print("🚨 Manueller Refill gestartet: sende 'Refill' an 80808.")
+            print("Manueller Refill gestartet: sende 'Refill' an 80808.")
+            versand_gestartet = False
+            outbox_vorher = None
             try:
                 with REFILL_SEND_LOCK:
                     if not router_session_sicherstellen():
-                        print("❌ Manueller Refill fehlgeschlagen: keine gültige Router-Session.")
+                        print("Manueller Refill fehlgeschlagen: keine gültige Router-Session.")
                         return
 
-                    vorher = outbox_snapshot()
+                    try:
+                        vorher = outbox_snapshot()
+                        outbox_vorher = vorher
+                    except Exception:
+                        melde_fehler(
+                            "outbox",
+                            "Die Outbox konnte vor dem manuellen Refill nicht gelesen werden; der Versand wurde abgebrochen.",
+                            art="read",
+                        )
+                        print("Manueller Refill fehlgeschlagen: Outbox konnte nicht gelesen werden.")
+                        return
+                    bereinige_fehler("outbox", nur_art="read")
+
+                    versand_gestartet = True
                     if not sende_neue_sms(LIDL_ABSENDER, REFILL_TEXT):
-                        print("❌ Manueller Refill fehlgeschlagen: SMS wurde nicht an den Router übermittelt.")
+                        melde_fehler(
+                            "outbox",
+                            "Der manuelle Refill wurde vom Router nicht als erfolgreich angenommen.",
+                            art="confirmation",
+                        )
+                        print("Manueller Refill fehlgeschlagen: SMS wurde nicht an den Router übermittelt.")
                         return
 
-                    time.sleep(3)
-                    nachher = outbox_snapshot()
+                    if not warte_auf_outbox_bestaetigung(vorher):
+                        print("Manueller Refill noch nicht bestätigt; die Outbox wird weiter geprüft.")
+                        return
 
-                if nachher - vorher:
-                    gui_status("letzter_refill", time.strftime("%H:%M:%S"))
-                    print("✅ Manueller Refill erfolgreich: neue Refill-SMS in der Outbox bestätigt.")
-                else:
-                    print("⚠️ Manueller Refill unbestätigt: Router nahm die SMS an, aber die Outbox zeigt keinen neuen Refill.")
+                print("Manueller Refill erfolgreich: neue Refill-SMS in der Outbox bestätigt.")
             except Exception as exc:
-                print("❌ Manueller Refill fehlgeschlagen:", exc)
+                print("Manueller Refill fehlgeschlagen:", exc)
+                if versand_gestartet:
+                    if outbox_vorher is not None:
+                        merke_ausstehende_outbox_bestaetigung(outbox_vorher)
+                    melde_fehler(
+                        "outbox",
+                        "Der manuelle Refill konnte nicht sicher übermittelt oder bestätigt werden.",
+                        art="confirmation",
+                    )
+                else:
+                    melde_fehler(
+                        "login",
+                        "Die Router-Verbindung konnte für den manuellen Refill nicht geprüft werden.",
+                    )
             finally:
                 try:
                     self.root.after(0, lambda: self.test_refill_button.config(state="normal"))
@@ -4216,7 +4471,7 @@ class CudyGUI:
 
         fenster = tk.Toplevel(self.root)
         self._band_dialog = fenster
-        fenster.title("📶 LTE-Bänder")
+        fenster.title("LTE-Bänder")
         fenster.geometry("470x470")
         fenster.transient(self.root)
         fenster.grab_set()
@@ -4350,7 +4605,7 @@ class CudyGUI:
                             fenster.destroy()
                             self.signal_aktualisieren()
                             print(
-                                "✅ LTE-Bandwahl gespeichert; Router und Internet "
+                                "LTE-Bandwahl gespeichert; Router und Internet "
                                 "sind wieder erreichbar."
                             )
                         elif kind == "restored":
@@ -4365,7 +4620,7 @@ class CudyGUI:
                             )
                             apply_button.config(state="normal")
                             print(
-                                "⚠️ LTE-Bandwahl zurückgerollt; vorherige Auswahl "
+                                "LTE-Bandwahl zurückgerollt; vorherige Auswahl "
                                 "und Internetverbindung wiederhergestellt."
                             )
                         elif kind == "restore_failed":
@@ -4376,7 +4631,7 @@ class CudyGUI:
                             )
                             apply_button.config(state="normal")
                             print(
-                                "❌ LTE-Bandwechsel fehlgeschlagen:", outcome["error"],
+                                "LTE-Bandwechsel fehlgeschlagen:", outcome["error"],
                                 "| Wiederherstellung:", outcome["restore_error"]
                             )
                         else:
@@ -4455,7 +4710,7 @@ class CudyGUI:
         letzter_erfolgreicher_poll = jetzt
 
         print()
-        print("💾 Einstellungen gespeichert:")
+        print("Einstellungen gespeichert:")
         print("   Router:", BASE_URL)
         print("   Poll:", "Aus" if POLL_INTERVAL == 0 else f"{POLL_INTERVAL} Sekunden")
         print(
@@ -4525,7 +4780,7 @@ class CudyGUI:
         )
 
         print(
-            "🗑️ GUI-Log gelöscht."
+            "GUI-Log gelöscht."
         )
 
     # ========================================================
@@ -4580,6 +4835,20 @@ class CudyGUI:
 
                     status_data[key] = value
 
+                    if key == "fehler":
+                        self.error_banner.config(text=value)
+                        if value and not self._error_banner_visible:
+                            self.error_banner.pack(
+                                before=self.notebook,
+                                fill="x",
+                                padx=15,
+                                pady=(0, 8),
+                            )
+                            self._error_banner_visible = True
+                        elif not value and self._error_banner_visible:
+                            self.error_banner.pack_forget()
+                            self._error_banner_visible = False
+
                     if key in self.labels:
 
                         self.labels[key].config(
@@ -4610,11 +4879,13 @@ class CudyGUI:
         if status == "Aktiv":
 
             self.status_label.config(
-                text="● Aktiv"
+                text="Aktiv"
             )
 
         elif status in (
             "Fehler",
+            "Login-Fehler",
+            "Session abgelaufen",
             "Timeout",
             "Netzwerkfehler",
             "Poll-Fehler",
@@ -4622,19 +4893,19 @@ class CudyGUI:
         ):
 
             self.status_label.config(
-                text="● Fehler"
+                text="Fehler"
             )
 
         elif status == "Gestoppt":
 
             self.status_label.config(
-                text="● Gestoppt"
+                text="Gestoppt"
             )
 
         else:
 
             self.status_label.config(
-                text=f"● {status}"
+                text=f"{status}"
             )
 
         # ----------------------------------------------------
@@ -4662,7 +4933,7 @@ class CudyGUI:
                 )
 
                 self.status_label.config(
-                    text="● Gestoppt"
+                    text="Gestoppt"
                 )
 
         self.root.after(
@@ -4685,7 +4956,7 @@ class CudyGUI:
             print()
 
             print(
-                "🛑 Cudy Auto Refill wird beendet..."
+                "Cudy Auto Refill wird beendet..."
             )
 
         self.root.destroy()

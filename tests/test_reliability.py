@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
+from html import escape as escape_html
 from unittest.mock import Mock, patch
 
 import cudy_auto_refill as app
@@ -78,6 +79,197 @@ class RouterLoginTests(unittest.TestCase):
         with patch.object(app, "session", router):
             with self.assertRaises(PermissionError):
                 app.hole_sms_seite("rec", 1)
+
+
+class SMSFixtureRegressionTests(unittest.TestCase):
+    fixture_path = Path(__file__).parent / "fixtures" / "sms_variants.json"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixtures = json.loads(cls.fixture_path.read_text(encoding="utf-8"))
+        cls.messages = {item["case"]: item for item in cls.fixtures["messages"]}
+
+    @staticmethod
+    def inbox_html(messages):
+        rows = []
+        for index, message in enumerate(messages, start=1):
+            rows.append(
+                "<tr>"
+                f'<td id="fixture-{index}-phone"><p>{escape_html(message["sender"])}</p></td>'
+                f'<td id="fixture-{index}-content"><p title="{escape_html(message["content"], quote=True)}">'
+                f'{escape_html(message["preview"])}</p></td>'
+                f'<td id="fixture-{index}-timestamp"><p>{escape_html(message["timestamp"])}</p></td>'
+                f'<td><button name="fixture-{index}.readsms" '
+                f'onclick="open(\'cfg={escape_html(message["cfg"], quote=True)}\')">More</button></td>'
+                "</tr>"
+            )
+        return "<table>" + "".join(rows) + "</table>"
+
+    def test_fixture_variants_match_and_parser_deduplicates_rows(self):
+        fast = self.messages["fast_consumed"]
+        depleted = self.messages["depleted_missing_sender"]
+        html = self.inbox_html([fast, fast, depleted])
+
+        messages = app.lese_sms(html)
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["content"], fast["content"])
+        self.assertTrue(app.ist_refill_trigger(messages[0]["content"]))
+        self.assertEqual(messages[1]["phone"], "")
+        self.assertEqual(messages[1]["content"], depleted["content"].strip())
+        self.assertTrue(app.ist_refill_trigger("  " + depleted["content"]))
+
+    def test_missing_sender_still_selects_refill_without_sending_real_sms(self):
+        message = self.messages["depleted_missing_sender"]
+        html = self.inbox_html([message])
+        parsed = app.lese_sms(html)
+        self.assertEqual(parsed[0]["phone"], "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(app, "APP_DATA_DIR", directory),
+                patch.object(app, "SMS_STATE_FILE", str(Path(directory) / "sms_state.json")),
+                patch.object(
+                    app, "LEGACY_SMS_STATE_FILE",
+                    str(Path(directory) / "missing_legacy_state.json"),
+                ),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with (
+                        patch.object(app.session, "request", side_effect=AssertionError("Network disabled in fixture tests")) as network_request,
+                        patch.object(app, "refill_versuch", return_value=True) as refill,
+                        patch.object(app, "sende_reply") as send_reply,
+                        patch.object(app, "sende_neue_sms") as send_new_sms,
+                    ):
+                        protected = app.verarbeite_sms_liste(parsed, html)
+
+            refill.assert_called_once_with(message["cfg"])
+            send_reply.assert_not_called()
+            send_new_sms.assert_not_called()
+            network_request.assert_not_called()
+            self.assertIn(app.sms_id(parsed[0]), protected)
+
+    def test_duplicate_rows_and_confirmed_sms_only_select_one_refill(self):
+        message = self.messages["fast_consumed"]
+        html = self.inbox_html([message, message])
+        parsed = app.lese_sms(html)
+        self.assertEqual(len(parsed), 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(app, "APP_DATA_DIR", directory),
+                patch.object(app, "SMS_STATE_FILE", str(Path(directory) / "sms_state.json")),
+                patch.object(
+                    app, "LEGACY_SMS_STATE_FILE",
+                    str(Path(directory) / "missing_legacy_state.json"),
+                ),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    with (
+                        patch.object(app.session, "request", side_effect=AssertionError("Network disabled in fixture tests")) as network_request,
+                        patch.object(app, "refill_versuch", return_value=True) as refill,
+                        patch.object(app, "sende_reply") as send_reply,
+                        patch.object(app, "sende_neue_sms") as send_new_sms,
+                    ):
+                        app.verarbeite_sms_liste(parsed, html)
+                        app.verarbeite_sms_liste(parsed, html)
+
+            refill.assert_called_once_with(message["cfg"])
+            send_reply.assert_not_called()
+            send_new_sms.assert_not_called()
+            network_request.assert_not_called()
+
+
+
+    def reset_outbox_state(self):
+        with app.AKTIVE_FEHLER_LOCK:
+            app.AKTIVE_FEHLER.clear()
+            app.AKTIVE_FEHLER_TYPEN.clear()
+        app.status_data["fehler"] = ""
+        with app.OUTBOX_PENDING_LOCK:
+            app.OUTBOX_PENDING_BASELINE = None
+            app.OUTBOX_PENDING_EXPIRES_AT = 0.0
+            app.OUTBOX_PENDING_NEXT_CHECK = 0.0
+
+    def test_http_200_reply_without_outbox_proof_keeps_alert_visible(self):
+        self.reset_outbox_state()
+        self.addCleanup(self.reset_outbox_state)
+
+        with redirect_stdout(io.StringIO()):
+            with (
+                patch.object(app, "outbox_snapshot", side_effect=[set(), set(), set(), set()]),
+                patch.object(app, "sende_reply", return_value=True) as send_reply,
+                patch.object(app.time, "sleep") as sleep,
+                patch.object(
+                    app.session, "request",
+                    side_effect=AssertionError("Network disabled in fixture tests"),
+                ) as network_request,
+            ):
+                confirmed = app.refill_versuch("fixture-cfg-fast")
+
+        self.assertFalse(confirmed)
+        send_reply.assert_called_once_with("fixture-cfg-fast", app.REFILL_TEXT)
+        self.assertEqual(sleep.call_count, len(app.OUTBOX_CONFIRMATION_DELAYS))
+        network_request.assert_not_called()
+        self.assertIn("outbox", app.AKTIVE_FEHLER)
+        self.assertTrue(app.status_data["fehler"])
+
+    def test_only_a_new_matching_outbox_refill_clears_confirmation_alert(self):
+        self.reset_outbox_state()
+        self.addCleanup(self.reset_outbox_state)
+
+        old_message = dict(self.messages["outbox_refill_old"])
+        old_message["phone"] = old_message["sender"]
+        new_message = dict(
+            old_message,
+            timestamp="FIXTURE_OUTBOX_NEW",
+            cfg="fixture-cfg-outbox-new",
+        )
+        baseline = {app.sms_id(old_message)}
+        app.merke_ausstehende_outbox_bestaetigung(baseline)
+        app.melde_fehler(
+            "outbox",
+            "Fixture: Refill noch nicht in der Outbox bestätigt.",
+            art="confirmation",
+        )
+
+        old_only_html = self.inbox_html([old_message])
+        with redirect_stdout(io.StringIO()):
+            with (
+                patch.object(
+                    app, "hole_alle_sms_seiten",
+                    return_value={"fixture-page": old_only_html},
+                ),
+                patch.object(
+                    app.session, "request",
+                    side_effect=AssertionError("Network disabled in fixture tests"),
+                ) as network_request,
+            ):
+                old_snapshot = app.outbox_snapshot()
+
+        self.assertEqual(old_snapshot, baseline)
+        self.assertTrue(app.status_data["fehler"])
+
+        old_and_new_html = self.inbox_html([old_message, new_message])
+        with redirect_stdout(io.StringIO()):
+            with (
+                patch.object(
+                    app, "hole_alle_sms_seiten",
+                    return_value={"fixture-page": old_and_new_html},
+                ),
+                patch.object(
+                    app.session, "request",
+                    side_effect=AssertionError("Network disabled in fixture tests"),
+                ) as second_network_request,
+            ):
+                new_snapshot = app.outbox_snapshot()
+
+        self.assertEqual(new_snapshot, {app.sms_id(old_message), app.sms_id(new_message)})
+        self.assertEqual(app.status_data["fehler"], "")
+        self.assertNotIn("outbox", app.AKTIVE_FEHLER)
+        network_request.assert_not_called()
+        second_network_request.assert_not_called()
+
 
 
 class BandFallbackTests(unittest.TestCase):
