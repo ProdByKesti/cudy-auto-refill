@@ -84,6 +84,15 @@ class RouterLoginTests(unittest.TestCase):
 class SMSFixtureRegressionTests(unittest.TestCase):
     fixture_path = Path(__file__).parent / "fixtures" / "sms_variants.json"
 
+    def test_refill_outbox_text_accepts_duplicated_tooltip_text(self):
+        self.assertTrue(app.ist_refill_outbox_text("Refill"))
+        self.assertTrue(app.ist_refill_outbox_text("Refill Refill"))
+        self.assertTrue(app.ist_refill_outbox_text("  REFILL   REFILL  "))
+
+        self.assertFalse(app.ist_refill_outbox_text("Please Refill"))
+        self.assertFalse(app.ist_refill_outbox_text("Refill later"))
+        self.assertFalse(app.ist_refill_outbox_text(""))
+
     @classmethod
     def setUpClass(cls):
         cls.fixtures = json.loads(cls.fixture_path.read_text(encoding="utf-8"))

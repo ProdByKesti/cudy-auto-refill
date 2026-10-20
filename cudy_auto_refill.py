@@ -2857,6 +2857,8 @@ class CudyGUI:
             value=f"{WATCHDOG_TIMEOUT} Sekunden"
         )
 
+        self.auto_follow = tk.BooleanVar(value=True)
+
         self.baue_gui()
 
         self.root.after(
@@ -4030,6 +4032,14 @@ class CudyGUI:
         )
         self.log_copy_button.pack(side="left", padx=(8, 0))
 
+        self.auto_follow_button = ttk.Checkbutton(
+            button_frame,
+            text="Auto-Follow: AN",
+            variable=self.auto_follow,
+            command=self.toggle_auto_follow,
+        )
+        self.auto_follow_button.pack(side="left", padx=(8, 0))
+
         # ----------------------------------------------------
         # LOG
         # ----------------------------------------------------
@@ -4816,9 +4826,8 @@ class CudyGUI:
                         excess_lines = line_count - MAX_GUI_LOG_LINES
                         self.log_text.delete("1.0", f"{excess_lines + 1}.0")
 
-                    self.log_text.see(
-                        "end"
-                    )
+                    if self.auto_follow.get():
+                        self.log_text.see("end")
 
                     self.log_text.config(
                         state="disabled"
@@ -4940,6 +4949,10 @@ class CudyGUI:
             100,
             self.update_gui
         )
+
+    def toggle_auto_follow(self):
+        label = "Auto-Follow: AN" if self.auto_follow.get() else "Auto-Follow: AUS"
+        self.auto_follow_button.config(text=label)
 
     # ========================================================
     # SCHLIESSEN

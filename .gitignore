@@ -15,3 +15,5 @@ sms_state.json*
 # This folder contains several downloaded variants; publish only the selected baseline.
 /main*.py
 !/main_settings_only_fixed2.py
+cudy_auto_refill_damaged_backup.py
+.continue/agents/new-config.yaml
