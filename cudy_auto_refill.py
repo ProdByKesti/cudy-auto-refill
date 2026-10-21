@@ -11,6 +11,7 @@ import queue
 import logging
 import re
 import unicodedata
+import uuid
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from tkinter import ttk, messagebox
@@ -47,7 +48,48 @@ LEGACY_SMS_STATE_FILE = os.path.join(APP_HOME_DIR, "sms_state.json")
 LTE_PROFILE_FILE = os.path.join(APP_DATA_DIR, "lte_profile.json")
 APP_LOG_FILE = os.path.join(APP_DATA_DIR, "cudy_auto_refill.log")
 SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
+INSTANCE_LOCK_FILE = os.path.join(APP_DATA_DIR, "app.lock")
 MAX_GUI_LOG_LINES = 3000
+
+_instance_lock_handle = None
+
+
+def acquire_single_instance_lock():
+    """Hold an OS-level file lock until this process exits."""
+    global _instance_lock_handle
+
+    os.makedirs(APP_DATA_DIR, exist_ok=True)
+    lock_handle = open(INSTANCE_LOCK_FILE, "a+b")
+
+    try:
+        lock_handle.seek(0, os.SEEK_END)
+        if lock_handle.tell() == 0:
+            lock_handle.write(b"\0")
+            lock_handle.flush()
+        lock_handle.seek(0)
+
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(
+                lock_handle.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+    except OSError:
+        lock_handle.close()
+        return False
+    except Exception:
+        lock_handle.close()
+        raise
+
+    # Keeping this handle alive keeps the OS lock active. The OS releases it
+    # automatically when the application process exits, including on crashes.
+    _instance_lock_handle = lock_handle
+    return True
 
 
 def lade_app_einstellungen():
@@ -258,6 +300,11 @@ def ist_refill_trigger(text):
 
 REFILL_TEXT = "Refill"
 REFILL_SEND_LOCK = threading.Lock()
+
+
+def log_refill_aktion(aktions_id, schritt, details):
+    """Write one redaction-safe, correlatable refill event to the app log."""
+    print(f"Refill-Aktion [{aktions_id}] | {schritt} | {details}")
 
 # ------------------------------------------------------------
 # SMS CLEANUP
@@ -1167,6 +1214,7 @@ OUTBOX_PENDING_TIMEOUT = 300
 OUTBOX_PENDING_BASELINE = None
 OUTBOX_PENDING_EXPIRES_AT = 0.0
 OUTBOX_PENDING_NEXT_CHECK = 0.0
+OUTBOX_PENDING_ACTION_ID = None
 OUTBOX_PENDING_LOCK = threading.Lock()
 
 
@@ -1174,47 +1222,80 @@ class OutboxSnapshotError(Exception):
     """The Outbox baseline could not be read before attempting a refill."""
 
 
-def merke_ausstehende_outbox_bestaetigung(baseline):
+def merke_ausstehende_outbox_bestaetigung(baseline, aktions_id=None):
     global OUTBOX_PENDING_BASELINE
     global OUTBOX_PENDING_EXPIRES_AT
     global OUTBOX_PENDING_NEXT_CHECK
+    global OUTBOX_PENDING_ACTION_ID
 
     with OUTBOX_PENDING_LOCK:
         OUTBOX_PENDING_BASELINE = set(baseline)
         OUTBOX_PENDING_EXPIRES_AT = time.monotonic() + OUTBOX_PENDING_TIMEOUT
         OUTBOX_PENDING_NEXT_CHECK = time.monotonic() + OUTBOX_PENDING_CHECK_INTERVAL
+        OUTBOX_PENDING_ACTION_ID = aktions_id
 
 
 def pruefe_ausstehende_outbox_bestaetigung(snapshot):
     global OUTBOX_PENDING_BASELINE
     global OUTBOX_PENDING_EXPIRES_AT
     global OUTBOX_PENDING_NEXT_CHECK
+    global OUTBOX_PENDING_ACTION_ID
 
     with OUTBOX_PENDING_LOCK:
         if OUTBOX_PENDING_BASELINE is None:
             return False
 
         if time.monotonic() >= OUTBOX_PENDING_EXPIRES_AT:
+            aktions_id = OUTBOX_PENDING_ACTION_ID
             OUTBOX_PENDING_BASELINE = None
             OUTBOX_PENDING_EXPIRES_AT = 0.0
             OUTBOX_PENDING_NEXT_CHECK = 0.0
-            return False
+            OUTBOX_PENDING_ACTION_ID = None
+            abgelaufen = True
+            neue_eintraege = set()
+        else:
+            abgelaufen = False
+            neue_eintraege = snapshot - OUTBOX_PENDING_BASELINE
+            aktions_id = OUTBOX_PENDING_ACTION_ID
 
-        neue_eintraege = snapshot - OUTBOX_PENDING_BASELINE
-        if not neue_eintraege:
+        if not abgelaufen and neue_eintraege:
+            OUTBOX_PENDING_BASELINE = None
+            OUTBOX_PENDING_EXPIRES_AT = 0.0
+            OUTBOX_PENDING_NEXT_CHECK = 0.0
+            OUTBOX_PENDING_ACTION_ID = None
+
+    if abgelaufen:
+        if aktions_id:
+            log_refill_aktion(
+                aktions_id,
+                "OUTBOX-BESTÄTIGUNG ABGELAUFEN",
+                "Innerhalb des Prüfzeitraums wurde kein neuer Refill-Eintrag gefunden.",
+            )
+        return False
+
+    if not neue_eintraege:
+        if aktions_id:
+            log_refill_aktion(
+                aktions_id,
+                "OUTBOX NOCH OFFEN",
+                "Noch kein neuer Refill-Eintrag gefunden; Prüfung läuft weiter.",
+            )
+        else:
             print(
                 "Outbox-Bestätigung offen: "
                 f"passende Refill-Einträge={len(snapshot)}, neue=0."
             )
-            return False
-
-        OUTBOX_PENDING_BASELINE = None
-        OUTBOX_PENDING_EXPIRES_AT = 0.0
-        OUTBOX_PENDING_NEXT_CHECK = 0.0
+        return False
 
     gui_status("letzter_refill", time.strftime("%H:%M:%S"))
     bereinige_fehler("outbox", nur_art="confirmation")
     print("Verzögerte Refill-Bestätigung in der Outbox erkannt.")
+    if aktions_id:
+        log_refill_aktion(
+            aktions_id,
+            "OUTBOX-BESTÄTIGT",
+            "Neuer Refill-Eintrag nach dem Versand gefunden.",
+        )
     return True
 
 
@@ -1222,6 +1303,7 @@ def pruefe_offene_outbox_bestaetigung():
     global OUTBOX_PENDING_BASELINE
     global OUTBOX_PENDING_EXPIRES_AT
     global OUTBOX_PENDING_NEXT_CHECK
+    global OUTBOX_PENDING_ACTION_ID
 
     with OUTBOX_PENDING_LOCK:
         if OUTBOX_PENDING_BASELINE is None:
@@ -1229,15 +1311,28 @@ def pruefe_offene_outbox_bestaetigung():
 
         jetzt = time.monotonic()
         if jetzt >= OUTBOX_PENDING_EXPIRES_AT:
+            aktions_id = OUTBOX_PENDING_ACTION_ID
             OUTBOX_PENDING_BASELINE = None
             OUTBOX_PENDING_EXPIRES_AT = 0.0
             OUTBOX_PENDING_NEXT_CHECK = 0.0
-            return
+            OUTBOX_PENDING_ACTION_ID = None
+            abgelaufen = True
+        else:
+            abgelaufen = False
 
-        if jetzt < OUTBOX_PENDING_NEXT_CHECK:
-            return
+        if not abgelaufen:
+            if jetzt < OUTBOX_PENDING_NEXT_CHECK:
+                return
+            OUTBOX_PENDING_NEXT_CHECK = jetzt + OUTBOX_PENDING_CHECK_INTERVAL
 
-        OUTBOX_PENDING_NEXT_CHECK = jetzt + OUTBOX_PENDING_CHECK_INTERVAL
+    if abgelaufen:
+        if aktions_id:
+            log_refill_aktion(
+                aktions_id,
+                "OUTBOX-BESTÄTIGUNG ABGELAUFEN",
+                "Innerhalb des Prüfzeitraums wurde kein neuer Refill-Eintrag gefunden.",
+            )
+        return
 
     try:
         with REFILL_SEND_LOCK:
@@ -1247,8 +1342,15 @@ def pruefe_offene_outbox_bestaetigung():
         return
 
 
-def warte_auf_outbox_bestaetigung(baseline):
+def warte_auf_outbox_bestaetigung(baseline, aktions_id=None):
     snapshot_fehler = False
+
+    if aktions_id:
+        log_refill_aktion(
+            aktions_id,
+            "OUTBOX-PRÜFUNG",
+            "Suche nach einem neuen Refill-Eintrag.",
+        )
 
     for wartezeit in OUTBOX_CONFIRMATION_DELAYS:
         time.sleep(wartezeit)
@@ -1261,9 +1363,15 @@ def warte_auf_outbox_bestaetigung(baseline):
         if snapshot - baseline:
             gui_status("letzter_refill", time.strftime("%H:%M:%S"))
             bereinige_fehler("outbox", nur_art="confirmation")
+            if aktions_id:
+                log_refill_aktion(
+                    aktions_id,
+                    "OUTBOX-BESTÄTIGT",
+                    "Neuer Refill-Eintrag nach dem Versand gefunden.",
+                )
             return True
 
-    merke_ausstehende_outbox_bestaetigung(baseline)
+    merke_ausstehende_outbox_bestaetigung(baseline, aktions_id)
     meldung = (
         "Die Outbox konnte nach dem Refill nicht geprüft werden; "
         "die Bestätigung wird später erneut abgefragt."
@@ -1272,6 +1380,12 @@ def warte_auf_outbox_bestaetigung(baseline):
         "die Bestätigung wird später erneut abgefragt."
     )
     melde_fehler("outbox", meldung, art="confirmation")
+    if aktions_id:
+        log_refill_aktion(
+            aktions_id,
+            "OUTBOX NOCH OFFEN",
+            "Bestätigung wird im Hintergrund weiter abgefragt.",
+        )
     return False
 
 
@@ -1499,9 +1613,14 @@ def sende_reply(
 # EINEN REFILL-VERSUCH
 # ============================================================
 
-def refill_versuch(cfg):
+def refill_versuch(cfg, aktions_id):
     print()
     print("Starte EINEN Refill-Versuch...")
+    log_refill_aktion(
+        aktions_id,
+        "VERSAND VORBEREITEN",
+        "Lese den Outbox-Stand vor dem Reply.",
+    )
 
     with REFILL_SEND_LOCK:
         try:
@@ -1510,6 +1629,11 @@ def refill_versuch(cfg):
             raise
         except Exception as e:
             print("Outbox-Snapshot vor dem Refill fehlgeschlagen:", e)
+            log_refill_aktion(
+                aktions_id,
+                "VERSAND ABGEBROCHEN",
+                "Der Outbox-Ausgangsstand konnte nicht gelesen werden.",
+            )
             melde_fehler(
                 "outbox",
                 "Die Outbox konnte vor dem Refill nicht gelesen werden; der Versand wurde abgebrochen.",
@@ -1518,11 +1642,26 @@ def refill_versuch(cfg):
             raise OutboxSnapshotError from e
 
         try:
+            log_refill_aktion(
+                aktions_id,
+                "VERSAND",
+                "Sende die Reply-SMS über den Router.",
+            )
             erfolg = sende_reply(cfg, REFILL_TEXT)
         except PermissionError:
+            log_refill_aktion(
+                aktions_id,
+                "VERSAND ABGEBROCHEN",
+                "Die Router-Sitzung ist abgelaufen.",
+            )
             raise
         except Exception:
-            merke_ausstehende_outbox_bestaetigung(outbox_vorher)
+            merke_ausstehende_outbox_bestaetigung(outbox_vorher, aktions_id)
+            log_refill_aktion(
+                aktions_id,
+                "VERSAND UNKLAR",
+                "Die Router-Antwort war nicht eindeutig; Outbox-Prüfung läuft weiter.",
+            )
             melde_fehler(
                 "outbox",
                 "Der Refill-Versand ist unklar; die Outbox wird weiter auf eine Bestätigung geprüft.",
@@ -1531,6 +1670,11 @@ def refill_versuch(cfg):
             raise
 
         if not erfolg:
+            log_refill_aktion(
+                aktions_id,
+                "VERSAND FEHLGESCHLAGEN",
+                "Der Router hat die Reply-SMS nicht angenommen.",
+            )
             melde_fehler(
                 "outbox",
                 "Refill-SMS wurde vom Router nicht als erfolgreich angenommen.",
@@ -1538,9 +1682,14 @@ def refill_versuch(cfg):
             )
             return False
 
+        log_refill_aktion(
+            aktions_id,
+            "VERSAND ANGENOMMEN",
+            "Der Router hat die Reply-Anfrage angenommen.",
+        )
         print("Warte auf Cudy-Verarbeitung...")
         print("Prüfe Outbox auf neue Refill-SMS...")
-        if warte_auf_outbox_bestaetigung(outbox_vorher):
+        if warte_auf_outbox_bestaetigung(outbox_vorher, aktions_id):
             print("Neues Refill in der Outbox bestätigt.")
             return True
 
@@ -1754,6 +1903,13 @@ def verarbeite_sms_liste(
         if not trigger_gefunden:
             continue
 
+        aktions_id = identifikation[:8].upper()
+        log_refill_aktion(
+            aktions_id,
+            "ERKANNT",
+            "Eine passende Trigger-SMS wurde in der Inbox gefunden.",
+        )
+
         geschützte_sms.add(
             identifikation
         )
@@ -1796,6 +1952,12 @@ def verarbeite_sms_liste(
 
         if eintrag["refill_success"]:
 
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Kein Versand: diese Trigger-SMS ist bereits bestätigt.",
+            )
+
             print(
                 "   Refill bereits bestätigt."
             )
@@ -1803,6 +1965,12 @@ def verarbeite_sms_liste(
             continue
 
         if eintrag["read_count"] > 2:
+
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Kein weiterer Versuch: die Beobachtungsgrenze ist erreicht.",
+            )
 
             print(
                 "   SMS wurde bereits "
@@ -1819,6 +1987,12 @@ def verarbeite_sms_liste(
 
         if eintrag["refill_attempts"] >= 2:
 
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Kein Versand: die maximale Zahl von zwei Versuchen ist erreicht.",
+            )
+
             print(
                 "   Bereits 2 Refill-Versuche."
             )
@@ -1831,6 +2005,12 @@ def verarbeite_sms_liste(
         )
 
         if not cfg:
+
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Noch kein Versand: Router-Zuordnung fehlt; SMS bleibt zur Prüfung offen.",
+            )
 
             print()
 
@@ -1849,6 +2029,11 @@ def verarbeite_sms_liste(
             "   SMS cfg:",
             cfg
         )
+        log_refill_aktion(
+            aktions_id,
+            "ENTSCHEIDUNG",
+            f"Versand freigegeben; Versuch {eintrag['refill_attempts'] + 1} von 2.",
+        )
 
         eintrag[
             "refill_attempts"
@@ -1864,9 +2049,15 @@ def verarbeite_sms_liste(
 
         try:
 
-            erfolg = refill_versuch(cfg)
+            erfolg = refill_versuch(cfg, aktions_id)
 
         except OutboxSnapshotError:
+
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Versuch nicht gezählt; Outbox-Ausgangsstand war nicht lesbar.",
+            )
 
             eintrag[
                 "refill_attempts"
@@ -1879,6 +2070,12 @@ def verarbeite_sms_liste(
             continue
 
         except PermissionError:
+
+            log_refill_aktion(
+                aktions_id,
+                "ERGEBNIS",
+                "Versand durch abgelaufene Router-Sitzung unterbrochen.",
+            )
 
             print()
 
@@ -1897,6 +2094,12 @@ def verarbeite_sms_liste(
             raise
 
         except Exception as e:
+
+            log_refill_aktion(
+                aktions_id,
+                "ERGEBNIS",
+                "Refill-Versand oder Outbox-Prüfung ist fehlgeschlagen.",
+            )
 
             print()
 
@@ -4406,19 +4609,45 @@ class CudyGUI:
         self.test_refill_button.config(state="disabled")
 
         def worker():
+            aktions_id = f"MAN-{uuid.uuid4().hex[:8].upper()}"
+            log_refill_aktion(
+                aktions_id,
+                "ERKANNT",
+                "Manueller Refill wurde im GUI ausgelöst.",
+            )
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Versand nach Bestätigung im Sicherheitsdialog freigegeben.",
+            )
             print("Manueller Refill gestartet: sende 'Refill' an 80808.")
             versand_gestartet = False
             outbox_vorher = None
             try:
                 with REFILL_SEND_LOCK:
                     if not router_session_sicherstellen():
+                        log_refill_aktion(
+                            aktions_id,
+                            "VERSAND ABGEBROCHEN",
+                            "Die Router-Sitzung konnte nicht hergestellt werden.",
+                        )
                         print("Manueller Refill fehlgeschlagen: keine gültige Router-Session.")
                         return
 
                     try:
+                        log_refill_aktion(
+                            aktions_id,
+                            "VERSAND VORBEREITEN",
+                            "Lese den Outbox-Stand vor dem manuellen Refill.",
+                        )
                         vorher = outbox_snapshot()
                         outbox_vorher = vorher
                     except Exception:
+                        log_refill_aktion(
+                            aktions_id,
+                            "VERSAND ABGEBROCHEN",
+                            "Der Outbox-Ausgangsstand konnte nicht gelesen werden.",
+                        )
                         melde_fehler(
                             "outbox",
                             "Die Outbox konnte vor dem manuellen Refill nicht gelesen werden; der Versand wurde abgebrochen.",
@@ -4429,7 +4658,17 @@ class CudyGUI:
                     bereinige_fehler("outbox", nur_art="read")
 
                     versand_gestartet = True
+                    log_refill_aktion(
+                        aktions_id,
+                        "VERSAND",
+                        "Sende die manuelle Refill-SMS über den Router.",
+                    )
                     if not sende_neue_sms(LIDL_ABSENDER, REFILL_TEXT):
+                        log_refill_aktion(
+                            aktions_id,
+                            "VERSAND FEHLGESCHLAGEN",
+                            "Der Router hat die SMS nicht als angenommen bestätigt.",
+                        )
                         melde_fehler(
                             "outbox",
                             "Der manuelle Refill wurde vom Router nicht als erfolgreich angenommen.",
@@ -4438,16 +4677,26 @@ class CudyGUI:
                         print("Manueller Refill fehlgeschlagen: SMS wurde nicht an den Router übermittelt.")
                         return
 
-                    if not warte_auf_outbox_bestaetigung(vorher):
+                    log_refill_aktion(
+                        aktions_id,
+                        "VERSAND ANGENOMMEN",
+                        "Der Router hat die SMS-Anfrage angenommen.",
+                    )
+                    if not warte_auf_outbox_bestaetigung(vorher, aktions_id):
                         print("Manueller Refill noch nicht bestätigt; die Outbox wird weiter geprüft.")
                         return
 
                 print("Manueller Refill erfolgreich: neue Refill-SMS in der Outbox bestätigt.")
             except Exception as exc:
+                log_refill_aktion(
+                    aktions_id,
+                    "ERGEBNIS",
+                    "Manueller Versand oder Bestätigung ist fehlgeschlagen.",
+                )
                 print("Manueller Refill fehlgeschlagen:", exc)
                 if versand_gestartet:
                     if outbox_vorher is not None:
-                        merke_ausstehende_outbox_bestaetigung(outbox_vorher)
+                        merke_ausstehende_outbox_bestaetigung(outbox_vorher, aktions_id)
                     melde_fehler(
                         "outbox",
                         "Der manuelle Refill konnte nicht sicher übermittelt oder bestätigt werden.",
@@ -4980,6 +5229,33 @@ class CudyGUI:
 # ============================================================
 
 if __name__ == "__main__":
+
+    try:
+        einzelne_instanz = acquire_single_instance_lock()
+    except OSError as exc:
+        start_root = tk.Tk()
+        start_root.withdraw()
+        messagebox.showerror(
+            "Cudy Auto Refill konnte nicht starten",
+            "Die Instanz-Sperre konnte nicht angelegt werden. "
+            "Zum Schutz vor doppelten Refill-Aktionen wurde der Start abgebrochen.\n\n"
+            f"Details: {exc}",
+            parent=start_root,
+        )
+        start_root.destroy()
+        raise SystemExit(1)
+
+    if not einzelne_instanz:
+        start_root = tk.Tk()
+        start_root.withdraw()
+        messagebox.showinfo(
+            "Instanz-Sperre verhindert den Start",
+            "Eine weitere Instanz läuft bereits oder die Instanz-Sperre ist nicht verfügbar. "
+            "Diese Instanz startet deshalb keinen zusätzlichen Polling- oder Refill-Loop.",
+            parent=start_root,
+        )
+        start_root.destroy()
+        raise SystemExit(0)
 
     import sys
 

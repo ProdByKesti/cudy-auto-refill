@@ -13,7 +13,9 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Inbox and outbox cleanup when configured message-count thresholds are reached
 - Session refresh and watchdog recovery with capped retry backoff
 - Manual LTE band selection with internet verification and automatic rollback if the connection does not recover
+- OS-level instance lock so a second copy exits before starting another polling or refill loop
 - Rotating, timestamped local logs and a redacted diagnostic-copy action
+- Correlated refill action entries with a short action ID, separating trigger detection, send decision, router submission, and immediate or delayed outbox confirmation
 - Optional log Auto-Follow control, enabled by default; turn it off to read or scroll older log entries without being pulled back to the bottom
 - All-band comparison of download throughput, HTTP probe latency, and jitter; the previous band selection is restored after a scan
 - One-time speed-test prompt on the first packaged EXE launch, with a repeatable test in the Signal tab
@@ -52,7 +54,7 @@ The program only starts monitoring after you press Start in the GUI. It can send
 
 Runtime state and logs are stored under `%LOCALAPPDATA%/CudyAutoRefill` regardless of the current working directory. On first use, an existing `sms_state.json` beside the working copy is copied there; the original is kept. The state tracks message IDs, content, timestamps, and refill attempts/successes. Do not delete it while trigger SMS messages remain in the inbox, or a message may be treated as unprocessed.
 
-The live GUI log is capped in memory. The rotating log keeps up to four files of about 1 MB each. The Log tab's Diagnose kopieren action redacts SMS bodies and credential-like values before copying a report.
+The live GUI log is capped in memory. The rotating log keeps up to four files of about 1 MB each. Refill action entries use short IDs and do not include SMS bodies. The Log tab's Diagnose kopieren action redacts SMS bodies and credential-like values before copying a report.
 
 The Log tab's Auto-Follow control starts enabled and keeps new messages in view. Turn it off to inspect earlier entries; incoming log messages continue to be recorded while the view stays at its current scroll position.
 
