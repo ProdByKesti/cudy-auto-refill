@@ -32,6 +32,10 @@ BASE_URL = "http://192.168.10.1"
 FIRST_START_TEST_MODE = (
     os.environ.get("CUDY_AUTO_REFILL_FIRST_START_TEST") == "1"
 )
+FIRST_START_TEST_SCENARIO = "success"
+FIRST_START_TEST_LOGIN_ATTEMPTS = 0
+FIRST_START_TEST_POLL_DONE = False
+FIRST_START_TEST_OUTBOX = set()
 APP_HOME_DIR = (
     os.path.dirname(sys.executable)
     if getattr(sys, "frozen", False)
@@ -132,6 +136,10 @@ def _setting_int(name, default, minimum, maximum):
 
 
 def speichere_app_einstellungen(value):
+    if FIRST_START_TEST_MODE:
+        APP_SETTINGS.update(value)
+        return True
+
     try:
         os.makedirs(APP_DATA_DIR, exist_ok=True)
         temporary = SETTINGS_FILE + ".tmp"
@@ -289,6 +297,9 @@ def _dpapi_transform(data, protect):
 
 
 def speichere_router_passwort(passwort):
+    if FIRST_START_TEST_MODE:
+        raise RuntimeError("Im Erststart-Testmodus werden keine Passwörter gespeichert.")
+
     encrypted = _dpapi_transform(passwort.encode("utf-8"), protect=True)
     os.makedirs(APP_DATA_DIR, exist_ok=True)
     temporary = CREDENTIALS_FILE + ".tmp"
@@ -365,6 +376,9 @@ def lade_lte_profil():
 
 
 def speichere_lte_profil(value):
+    if FIRST_START_TEST_MODE:
+        return
+
     try:
         os.makedirs(APP_DATA_DIR, exist_ok=True)
         temporary = LTE_PROFILE_FILE + ".tmp"
@@ -540,7 +554,35 @@ class QueueLogger:
 # SESSION
 # ============================================================
 
-session = requests.Session()
+class NetzwerkGesperrteRouterSession:
+    """Fail closed if the first-start test path attempts router I/O."""
+
+    def __init__(self):
+        self.cookies = requests.cookies.RequestsCookieJar()
+        self.headers = requests.structures.CaseInsensitiveDict()
+
+    def request(self, method, url, *args, **kwargs):
+        raise RuntimeError(
+            "Router-Netzwerkzugriff ist im Erststart-Testmodus gesperrt."
+        )
+
+    def get(self, url, *args, **kwargs):
+        return self.request("GET", url, *args, **kwargs)
+
+    def post(self, url, *args, **kwargs):
+        return self.request("POST", url, *args, **kwargs)
+
+    def close(self):
+        self.cookies.clear()
+
+
+def erstelle_router_session():
+    if FIRST_START_TEST_MODE:
+        return NetzwerkGesperrteRouterSession()
+    return requests.Session()
+
+
+session = erstelle_router_session()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -658,6 +700,9 @@ def extrahiere_feld(html, name):
 # ============================================================
 
 def hole_token():
+    if FIRST_START_TEST_MODE:
+        raise RuntimeError("Router-Tokenabruf ist im Erststart-Testmodus gesperrt.")
+
     response = session.post(
         f"{BASE_URL}/cgi-bin/luci/admin/get_token",
         timeout=REQUEST_TIMEOUT
@@ -674,7 +719,14 @@ def hole_token():
 
 def pruefe_router_anmeldung(passwort, router_session=None):
     """Verify a candidate password by logging in and opening a protected page."""
-    router_session = router_session or requests.Session()
+    if FIRST_START_TEST_MODE:
+        return (
+            False,
+            router_session or erstelle_router_session(),
+            "Routeranmeldung ist im Erststart-Testmodus nur simuliert.",
+        )
+
+    router_session = router_session or erstelle_router_session()
     phase = "Router-Startseite"
 
     try:
@@ -751,7 +803,14 @@ def pruefe_und_speichere_router_passwort(passwort):
     global PASSWORT
     global session
 
-    router_session = requests.Session()
+    if FIRST_START_TEST_MODE:
+        if FIRST_START_TEST_SCENARIO == "password_rejected":
+            return False, "Simulation: Das eingegebene Router-Passwort wurde abgelehnt."
+        PASSWORT = passwort
+        print("Testmodus: Passwort nur für diese Sitzung übernommen; nichts gespeichert.")
+        return True, "Testmodus: Passwort nur simuliert und nicht gespeichert."
+
+    router_session = erstelle_router_session()
     erfolgreich, router_session, grund = pruefe_router_anmeldung(
         passwort,
         router_session,
@@ -774,7 +833,14 @@ def aendere_router_admin_passwort(altes_passwort, neues_passwort):
     global PASSWORT
     global session
 
-    router_session = requests.Session()
+    if FIRST_START_TEST_MODE:
+        if FIRST_START_TEST_SCENARIO == "password_rejected":
+            return False, "Simulation: Das bisherige Router-Passwort wurde abgelehnt."
+        PASSWORT = neues_passwort
+        print("Testmodus: Passwortänderung simuliert; der Router blieb unverändert.")
+        return True, "Testmodus: Passwortänderung simuliert; nichts am Router geändert."
+
+    router_session = erstelle_router_session()
     angemeldet, router_session, grund = pruefe_router_anmeldung(
         altes_passwort,
         router_session,
@@ -850,7 +916,7 @@ def aendere_router_admin_passwort(altes_passwort, neues_passwort):
     except requests.RequestException:
         return False, "Der Router hat die Passwortänderung nicht bestätigt. Der App-Speicher blieb unverändert."
 
-    neue_session = requests.Session()
+    neue_session = erstelle_router_session()
     bestaetigt, neue_session, grund = pruefe_router_anmeldung(
         neues_passwort,
         neue_session,
@@ -881,8 +947,36 @@ def aendere_router_admin_passwort(altes_passwort, neues_passwort):
 
 def login():
     global PASSWORT
+    global FIRST_START_TEST_LOGIN_ATTEMPTS
     print()
     print("Starte Cudy Login...")
+
+    if FIRST_START_TEST_MODE:
+        FIRST_START_TEST_LOGIN_ATTEMPTS += 1
+        scenario = FIRST_START_TEST_SCENARIO
+        fehlgeschlagen = (
+            scenario == "router_offline"
+            or (scenario == "retry_once" and FIRST_START_TEST_LOGIN_ATTEMPTS == 1)
+            or scenario == "password_rejected"
+        )
+        if fehlgeschlagen:
+            if scenario == "router_offline":
+                grund = "Simulation: Router ist nicht erreichbar."
+            elif scenario == "retry_once":
+                grund = "Simulation: erster Loginversuch fehlgeschlagen."
+            else:
+                grund = "Simulation: Router-Passwort wurde abgelehnt."
+            print("TESTMODUS – LOGIN FEHLGESCHLAGEN:", grund)
+            gui_status("router", "Verbindung fehlgeschlagen (simuliert)")
+            gui_status("status", "Login-Fehler")
+            melde_fehler("login", grund + " Automatische Wiederholungen werden simuliert.")
+            return False
+
+        print("TESTMODUS – LOGIN ERFOLGREICH (simuliert; kein Router kontaktiert).")
+        gui_status("router", "Verbunden (simuliert)")
+        gui_status("status", "Aktiv")
+        bereinige_fehler("login")
+        return True
 
     if not PASSWORT:
         PASSWORT = lade_router_passwort()
@@ -1037,6 +1131,9 @@ def hole_sms_seite(
     smsbox="rec",
     page=1
 ):
+    if FIRST_START_TEST_MODE:
+        raise RuntimeError("Router-Inbox-Zugriff ist im Erststart-Testmodus gesperrt.")
+
     url = (
         f"{BASE_URL}"
         "/cgi-bin/luci/admin/network/gcom/sms/"
@@ -1520,6 +1617,9 @@ def lade_sms_state():
 
 def speichere_sms_state(state):
 
+    if FIRST_START_TEST_MODE:
+        return
+
     os.makedirs(APP_DATA_DIR, exist_ok=True)
     temp_file = (
         SMS_STATE_FILE
@@ -1732,6 +1832,9 @@ def warte_auf_outbox_bestaetigung(baseline, aktions_id=None):
 
 def outbox_snapshot():
 
+    if FIRST_START_TEST_MODE:
+        return set(FIRST_START_TEST_OUTBOX)
+
     seiten = hole_alle_sms_seiten(
         "sto"
     )
@@ -1774,6 +1877,10 @@ def sende_reply(
     cfg,
     antwort
 ):
+    if FIRST_START_TEST_MODE:
+        print("Testmodus: Reply-Versand blockiert; es wurde keine SMS gesendet.")
+        return False
+
     print()
     print(
         "Starte SMS-Reply..."
@@ -1955,6 +2062,31 @@ def sende_reply(
 # ============================================================
 
 def refill_versuch(cfg, aktions_id):
+    if FIRST_START_TEST_MODE:
+        baseline = outbox_snapshot()
+        test_outbox_entry = f"SIMULIERTER-REFILL-{uuid.uuid4().hex[:8]}"
+        FIRST_START_TEST_OUTBOX.add(test_outbox_entry)
+        log_refill_aktion(
+            aktions_id,
+            "SIMULATION",
+            "Refill-Anfrage simuliert; keine SMS wurde gesendet.",
+        )
+        if not (outbox_snapshot() - baseline):
+            log_refill_aktion(
+                aktions_id,
+                "OUTBOX NICHT BESTÄTIGT",
+                "Die simulierte Outbox enthält keinen neuen Refill-Eintrag.",
+            )
+            return False
+        log_refill_aktion(
+            aktions_id,
+            "OUTBOX-BESTÄTIGT",
+            "Neuer simulierter Refill-Eintrag wurde in der Test-Outbox gefunden.",
+        )
+        gui_status("letzter_refill", "Simuliert")
+        print("Testmodus: Refill und Outbox-Bestätigung simuliert; kein Routerzugriff.")
+        return True
+
     print()
     print("Starte EINEN Refill-Versuch...")
     log_refill_aktion(
@@ -2039,6 +2171,9 @@ def refill_versuch(cfg, aktions_id):
 
 def router_session_sicherstellen():
     """Reuse the current login; renew it only when the router rejects it."""
+    if FIRST_START_TEST_MODE:
+        return False
+
     sms_page_url = f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms?iface=4g"
     response = session.get(sms_page_url, timeout=REQUEST_TIMEOUT)
     login_form = BeautifulSoup(response.text, "html.parser").find(
@@ -2066,6 +2201,10 @@ def router_session_sicherstellen():
 
 def sende_neue_sms(empfaenger, nachricht):
     """Load and submit the Cudy SMS compose form directly."""
+    if FIRST_START_TEST_MODE:
+        print("Testmodus: Manueller SMS-Versand blockiert; es wurde keine SMS gesendet.")
+        return False
+
     form_url = (
         f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms/"
         "smsnew?nomodal=&iface=4g"
@@ -2340,9 +2479,10 @@ def verarbeite_sms_liste(
 
             continue
 
-        cfg = finde_cfg_fuer_sms(
-            html,
-            sms
+        cfg = (
+            "SIMULIERT"
+            if FIRST_START_TEST_MODE
+            else finde_cfg_fuer_sms(html, sms)
         )
 
         if not cfg:
@@ -2555,6 +2695,10 @@ def loesche_sms(
     cfg,
     smsbox
 ):
+    if FIRST_START_TEST_MODE:
+        print("Testmodus: SMS-Löschen blockiert; der Router bleibt unverändert.")
+        return False
+
     url = (
         f"{BASE_URL}"
         "/cgi-bin/luci/admin/network/gcom/sms/"
@@ -2666,6 +2810,10 @@ def cleanup_smsbox(
     target_limit,
     geschützte_sms=None
 ):
+    if FIRST_START_TEST_MODE:
+        print("Testmodus: SMS-Cleanup übersprungen; es wird nichts gelöscht.")
+        return
+
     if geschützte_sms is None:
         geschützte_sms = set()
 
@@ -2854,6 +3002,25 @@ def cleanup(
 def poll():
     global letzter_erfolgreicher_poll
 
+    if FIRST_START_TEST_MODE:
+        global FIRST_START_TEST_POLL_DONE
+        gui_status("letzter_poll", time.strftime("%H:%M:%S"))
+        letzter_erfolgreicher_poll = time.monotonic()
+        if FIRST_START_TEST_POLL_DONE:
+            gui_status("inbox", "0 (simuliert)")
+            print("Poll OK | Inbox Seite 1: 0 SMS (simuliert; kein Router kontaktiert).")
+            return set()
+
+        FIRST_START_TEST_POLL_DONE = True
+        sms = {
+            "phone": "",
+            "content": "Deine Unlimited-1GB Option ist fast verbraucht.",
+            "timestamp": "Erststart-Test",
+        }
+        print("Poll OK | 1 Beispiel-SMS ohne Absender simuliert.")
+        gui_status("inbox", "1 (simuliert)")
+        return verarbeite_sms_liste([sms], "")
+
     html = hole_sms_seite(
         "rec",
         1
@@ -2936,6 +3103,7 @@ def session_recovery():
 # ============================================================
 
 def hauptschleife():
+    global programm_laeuft
     global letzter_session_refresh
     global letzter_erfolgreicher_poll
     global poll_fehler
@@ -3016,6 +3184,16 @@ def hauptschleife():
     while programm_laeuft:
         if login():
             break
+
+        if FIRST_START_TEST_MODE:
+            if FIRST_START_TEST_LOGIN_ATTEMPTS >= 3:
+                print("Testmodus: drei simulierte Loginversuche abgeschlossen.")
+                gui_status("status", "Login-Fehler")
+                programm_laeuft = False
+                return
+            print("Testmodus: simulierter Login-Retry in 1 Sekunde.")
+            time.sleep(1)
+            continue
 
         print()
         print("Login fehlgeschlagen.")
@@ -3363,6 +3541,8 @@ class CudyGUI:
         self.root.title(
             "Cudy Auto Refill"
         )
+        if FIRST_START_TEST_MODE:
+            self.root.title("Cudy Auto Refill — Erststart-Test")
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -3413,8 +3593,82 @@ class CudyGUI:
 
         self.root.after(
             500,
-            self.erste_app_einrichtung
+            self.start_first_start_flow
         )
+
+    def start_first_start_flow(self):
+        if not FIRST_START_TEST_MODE:
+            self.erste_app_einrichtung()
+            return
+
+        fenster = tk.Toplevel(self.root)
+        fenster.title("Erststart-Test: Szenario wählen")
+        fenster.transient(self.root)
+        fenster.resizable(False, False)
+        fenster.protocol("WM_DELETE_WINDOW", lambda: starten())
+
+        frame = ttk.Frame(fenster, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Sicherer Erststart-Test",
+            font=("Segoe UI", 13, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text=(
+                "Alle Router-, LTE- und SMS-Aktionen bleiben simuliert. "
+                "Wähle einen Ablauf; danach erscheint die normale Erststart-Einrichtung."
+            ),
+            wraplength=470,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 12))
+
+        scenario_var = tk.StringVar(value=FIRST_START_TEST_SCENARIO)
+        scenarios = (
+            ("success", "Verbindung erfolgreich"),
+            ("retry_once", "Erster Login scheitert, Wiederholung klappt"),
+            ("router_offline", "Router nicht erreichbar; drei Wiederholungen"),
+            ("password_rejected", "Router-Passwort wird abgelehnt"),
+        )
+        for value, label in scenarios:
+            ttk.Radiobutton(
+                frame,
+                text=label,
+                value=value,
+                variable=scenario_var,
+            ).pack(anchor="w", pady=3)
+
+        def starten():
+            global FIRST_START_TEST_SCENARIO
+            global FIRST_START_TEST_LOGIN_ATTEMPTS
+            global FIRST_START_TEST_POLL_DONE
+            global FIRST_START_TEST_OUTBOX
+
+            FIRST_START_TEST_SCENARIO = scenario_var.get()
+            FIRST_START_TEST_LOGIN_ATTEMPTS = 0
+            FIRST_START_TEST_POLL_DONE = False
+            FIRST_START_TEST_OUTBOX = set()
+            try:
+                fenster.destroy()
+            except tk.TclError:
+                pass
+            print(
+                "Erststart-Test-Szenario:",
+                dict(scenarios).get(FIRST_START_TEST_SCENARIO, "Unbekannt"),
+            )
+            self.erste_app_einrichtung()
+
+        ttk.Button(frame, text="Erststart durchspielen", command=starten).pack(
+            anchor="e", pady=(14, 0)
+        )
+        fenster.bind("<Return>", lambda _event: starten())
+        fenster.grab_set()
+        fenster.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - fenster.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - fenster.winfo_height()) // 2
+        fenster.geometry(f"+{max(0, x)}+{max(0, y)}")
+        fenster.focus_set()
 
     # ========================================================
     # GUI AUFBAU
@@ -4719,9 +4973,17 @@ class CudyGUI:
         global PASSWORT
         global programm_laeuft
         global backend_thread
+        global FIRST_START_TEST_LOGIN_ATTEMPTS
+        global FIRST_START_TEST_POLL_DONE
+        global FIRST_START_TEST_OUTBOX
 
         if programm_laeuft:
             return
+
+        if FIRST_START_TEST_MODE:
+            FIRST_START_TEST_LOGIN_ATTEMPTS = 0
+            FIRST_START_TEST_POLL_DONE = False
+            FIRST_START_TEST_OUTBOX = set()
 
         if not PASSWORT:
             PASSWORT = lade_router_passwort()
@@ -4811,6 +5073,12 @@ class CudyGUI:
                 "Anmeldung am Router und speichert es erst danach geschützt."
             )
             fields = [("Aktuelles Router-Passwort", "current")]
+
+        if FIRST_START_TEST_MODE:
+            help_text = (
+                "Sicherer Test: Die Eingabe wird nur in dieser Sitzung verwendet. "
+                "Es wird kein Router kontaktiert und kein Passwort gespeichert."
+            )
 
         ttk.Label(
             frame,
@@ -5146,14 +5414,24 @@ class CudyGUI:
             return
         profile["erststart_speedtest_gezeigt"] = True
         speichere_lte_profil(profile)
+        speedtest_hinweis = (
+            "Möchtest du einen LTE-Bandvergleich simulieren?\n\n"
+            "Im Erststart-Test wird kein LTE-Band geändert und kein Datenvolumen geladen."
+            if FIRST_START_TEST_MODE
+            else (
+                "Möchtest du jetzt alle verfügbaren LTE-Bänder vergleichen?\n\n"
+                "Der Router verbindet sich für jedes Band neu. Bei zehn Bändern "
+                "werden bis zu etwa 80 MB Mobilfunkdaten geladen.\n\n"
+                "Du kannst den Test später im Reiter „Signal“ erneut starten."
+            )
+        )
         if messagebox.askyesno(
             "LTE-Einrichtung",
-            "Möchtest du jetzt alle verfügbaren LTE-Bänder vergleichen?\n\n"
-            "Der Router verbindet sich für jedes Band neu. Bei zehn Bändern "
-            "werden bis zu etwa 80 MB Mobilfunkdaten geladen.\n\n"
-            "Du kannst den Test später im Reiter „Signal“ erneut starten.",
+            speedtest_hinweis,
             parent=self.root
         ):
+            self.notebook.select(self.signal_tab)
+            self.root.update_idletasks()
             self.speedtest_alle_baender(bestaetigung=False)
 
     def speedtest_abbrechen(self):
@@ -5164,6 +5442,21 @@ class CudyGUI:
             )
 
     def speedtest_alle_baender(self, bestaetigung=True):
+        if FIRST_START_TEST_MODE:
+            self.band_speedtest_results.config(state="normal")
+            self.band_speedtest_results.delete("1.0", "end")
+            self.band_speedtest_results.insert(
+                "1.0",
+                "SIMULIERTE ERGEBNISSE\n"
+                "Download: B28 (42,0 Mbit/s)\n"
+                "Gaming/Streaming: B3 (Ping 31 ms, Jitter 4 ms)\n\n"
+                "Beispielwerte – es wurde kein Router angesprochen und kein Testdatenvolumen geladen.",
+            )
+            self.band_speedtest_results.config(state="disabled")
+            self.band_speedtest_status.set("LTE-Bandvergleich simuliert; keine Routeränderung.")
+            print("Erststart-Test: LTE-Bandvergleich simuliert; kein Routerzugriff.")
+            return
+
         if self._band_test_running:
             return
         if programm_laeuft:
@@ -5301,6 +5594,10 @@ class CudyGUI:
     # ========================================================
 
     def signal_aktualisieren(self):
+        if FIRST_START_TEST_MODE:
+            self.signal_value.config(text="Testmodus: Automatische Bandwahl (simuliert)")
+            return
+
         if programm_laeuft:
             return
 
@@ -5328,6 +5625,17 @@ class CudyGUI:
     # ========================================================
 
     def test_refill(self):
+        if FIRST_START_TEST_MODE:
+            aktions_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
+            log_refill_aktion(
+                aktions_id,
+                "SIMULATION",
+                "Manueller Refill simuliert; es wurde keine SMS gesendet.",
+            )
+            gui_status("letzter_refill", "Simuliert")
+            print("Erststart-Test: Manueller Refill simuliert; keine SMS versendet.")
+            return
+
         if not messagebox.askyesno(
             "Notfall-Refill senden?",
             f"Jetzt '{REFILL_TEXT}' per SMS an {LIDL_ABSENDER} senden?\n\n"
@@ -5450,6 +5758,15 @@ class CudyGUI:
     # ========================================================
 
     def baender_verwalten(self):
+        if FIRST_START_TEST_MODE:
+            messagebox.showinfo(
+                "LTE-Bänder",
+                "Die Bandverwaltung ist im Erststart-Testmodus deaktiviert. "
+                "Der Router wird nicht angesprochen.",
+                parent=self.root,
+            )
+            return
+
         if programm_laeuft or self._band_test_running:
             messagebox.showinfo(
                 "Überwachung anhalten",
@@ -5679,6 +5996,13 @@ class CudyGUI:
                 SMS_STATE_FILE,
                 LTE_PROFILE_FILE,
                 APP_LOG_FILE,
+                os.path.join(NORMAL_APP_DATA_DIR, "settings.json"),
+                os.path.join(NORMAL_APP_DATA_DIR, "router_password.dpapi"),
+                os.path.join(NORMAL_APP_DATA_DIR, "sms_state.json"),
+                os.path.join(NORMAL_APP_DATA_DIR, "lte_profile.json"),
+                os.path.join(NORMAL_APP_DATA_DIR, "cudy_auto_refill.log"),
+                os.path.join(APP_HOME_DIR, "cudy_credentials.json"),
+                os.path.join(APP_HOME_DIR, "sms_state.json"),
                 LEGACY_SMS_STATE_FILE,
                 *LEGACY_CREDENTIAL_FILES,
             )

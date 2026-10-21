@@ -55,9 +55,18 @@ To repeat the onboarding flow on every launch, run the separate first-start test
 python cudy_auto_refill_first_start.py
 ```
 
-It uses an isolated test data folder, ignores saved passwords and SMS history, and repeats both the router-password onboarding and first-start LTE speed-test prompt. The normal app data remains untouched. The test launcher shares the app's instance lock, so close the normal app before starting it.
+It uses an isolated test profile and ignores saved passwords and SMS history. On each launch, choose one of four repeatable scenarios: successful connection, one failed login followed by success, an unavailable router with three retries, or a rejected router password. The normal router-password onboarding and LTE prompt then run again.
 
-The program only starts monitoring after you press Start in the GUI. It can send SMS replies and delete SMS during cleanup, so review the router address and cleanup thresholds before starting it.
+| First-start scenario | Expected result |
+| --- | --- |
+| Successful connection | Simulated login succeeds; a sender-less sample trigger is handled and a simulated outbox entry confirms the refill. |
+| Retry once | The first login fails and the next simulated attempt succeeds. |
+| Router unavailable | Three simulated login attempts fail and the login error remains visible. |
+| Password rejected | The password dialog remains open and reports the simulated rejection. |
+
+In this mode, router access, LTE band changes, SMS sending, refill actions, and SMS cleanup are blocked or simulated. A sample trigger SMS with a missing sender and its outbox confirmation are simulated locally. No credentials, settings, LTE profile, or SMS state are written. The launcher runs the current `cudy_auto_refill.py`, so feature updates stay in sync without maintaining a second copy of the application. It shares the app's instance lock; close the normal app before starting it.
+
+In normal mode, monitoring starts only after you press Start in the GUI. It can send SMS replies and delete SMS during cleanup, so review the router address and cleanup thresholds before starting it. The first-start test launcher blocks those actions.
 
 ## Working copy
 
