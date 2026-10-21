@@ -29,14 +29,21 @@ from lte_features import (
 # ============================================================
 
 BASE_URL = "http://192.168.10.1"
+FIRST_START_TEST_MODE = (
+    os.environ.get("CUDY_AUTO_REFILL_FIRST_START_TEST") == "1"
+)
 APP_HOME_DIR = (
     os.path.dirname(sys.executable)
     if getattr(sys, "frozen", False)
     else os.path.dirname(os.path.abspath(__file__))
 )
+LOCAL_DATA_ROOT = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+NORMAL_APP_DATA_DIR = os.path.join(LOCAL_DATA_ROOT, "CudyAutoRefill")
 APP_DATA_DIR = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "CudyAutoRefill",
+    LOCAL_DATA_ROOT,
+    "CudyAutoRefill_FirstStartTest"
+    if FIRST_START_TEST_MODE
+    else "CudyAutoRefill",
 )
 CREDENTIALS_FILE = os.path.join(APP_DATA_DIR, "router_password.dpapi")
 LEGACY_CREDENTIAL_FILES = (
@@ -45,10 +52,18 @@ LEGACY_CREDENTIAL_FILES = (
 )
 SMS_STATE_FILE = os.path.join(APP_DATA_DIR, "sms_state.json")
 LEGACY_SMS_STATE_FILE = os.path.join(APP_HOME_DIR, "sms_state.json")
+if FIRST_START_TEST_MODE:
+    # The test launcher must never import live credentials or SMS history.
+    LEGACY_CREDENTIAL_FILES = ()
+    LEGACY_SMS_STATE_FILE = os.path.join(
+        APP_DATA_DIR,
+        "__no_legacy_sms_state__.json",
+    )
 LTE_PROFILE_FILE = os.path.join(APP_DATA_DIR, "lte_profile.json")
 APP_LOG_FILE = os.path.join(APP_DATA_DIR, "cudy_auto_refill.log")
 SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
-INSTANCE_LOCK_FILE = os.path.join(APP_DATA_DIR, "app.lock")
+# Keep one lock shared by normal and test launches to prevent duplicate polling.
+INSTANCE_LOCK_FILE = os.path.join(NORMAL_APP_DATA_DIR, "app.lock")
 MAX_GUI_LOG_LINES = 3000
 
 _instance_lock_handle = None
@@ -59,6 +74,7 @@ def acquire_single_instance_lock():
     global _instance_lock_handle
 
     os.makedirs(APP_DATA_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(INSTANCE_LOCK_FILE), exist_ok=True)
     lock_handle = open(INSTANCE_LOCK_FILE, "a+b")
 
     try:
@@ -101,7 +117,7 @@ def lade_app_einstellungen():
         return {}
 
 
-APP_SETTINGS = lade_app_einstellungen()
+APP_SETTINGS = {} if FIRST_START_TEST_MODE else lade_app_einstellungen()
 _saved_router_url = APP_SETTINGS.get("router_url")
 if isinstance(_saved_router_url, str) and _saved_router_url.startswith(("http://", "https://")):
     BASE_URL = _saved_router_url.rstrip("/")
@@ -122,6 +138,7 @@ def speichere_app_einstellungen(value):
         with open(temporary, "w", encoding="utf-8") as f:
             json.dump(value, f, ensure_ascii=False, indent=2)
         os.replace(temporary, SETTINGS_FILE)
+        APP_SETTINGS.update(value)
         return True
     except OSError as exc:
         print("Einstellungen konnten nicht gespeichert werden:", exc)
@@ -185,9 +202,8 @@ def speichere_router_passwort(passwort):
 
 
 def lade_router_passwort():
-    passwort = os.environ.get("CUDY_ROUTER_PASSWORD")
-    if passwort:
-        return passwort
+    if FIRST_START_TEST_MODE:
+        return ""
 
     try:
         with open(CREDENTIALS_FILE, "rb") as f:
@@ -197,6 +213,10 @@ def lade_router_passwort():
         pass
     except (OSError, ValueError, UnicodeDecodeError):
         print("Geschütztes Router-Passwort konnte nicht gelesen werden.")
+
+    passwort = os.environ.get("CUDY_ROUTER_PASSWORD")
+    if passwort:
+        return passwort
 
     for path in LEGACY_CREDENTIAL_FILES:
         try:
@@ -222,10 +242,24 @@ def lade_router_passwort():
     return ""
 
 
+def router_passwort_speicherstatus():
+    if FIRST_START_TEST_MODE:
+        return "Erststart-Test: Passwort wird bei jedem Start erneut abgefragt"
+    if os.path.isfile(CREDENTIALS_FILE):
+        return "In Windows DPAPI geschützt gespeichert"
+    if os.environ.get("CUDY_ROUTER_PASSWORD"):
+        return "Über Umgebungsvariable bereitgestellt"
+    if any(os.path.isfile(path) for path in LEGACY_CREDENTIAL_FILES):
+        return "Vorhanden; wird nach erfolgreichem Login geschützt übernommen"
+    return "Noch nicht eingerichtet"
+
+
 # The password is loaded lazily when the first router login is attempted.
 PASSWORT = ""
 
 def lade_lte_profil():
+    if FIRST_START_TEST_MODE:
+        return {}
     try:
         with open(LTE_PROFILE_FILE, "r", encoding="utf-8") as f:
             value = json.load(f)
@@ -253,6 +287,7 @@ SESSION_REFRESH_INTERVAL = _setting_int("session_refresh_interval", 300, 0, 8640
 
 # Netzwerk-Timeout
 REQUEST_TIMEOUT = 10
+ROUTER_AUTH_TIMEOUT = 20
 
 # Watchdog
 MAX_POLL_FEHLER = 3
@@ -539,6 +574,213 @@ def hole_token():
     print("Router-Token erhalten.")
 
     return token
+
+
+def pruefe_router_anmeldung(passwort, router_session=None):
+    """Verify a candidate password by logging in and opening a protected page."""
+    router_session = router_session or requests.Session()
+    phase = "Router-Startseite"
+
+    try:
+        response = router_session.get(
+            f"{BASE_URL}/cgi-bin/luci/",
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        html = response.text
+        csrf = extrahiere_feld(html, "_csrf")
+        salt = extrahiere_feld(html, "salt")
+        username = extrahiere_feld(html, "luci_username") or "admin"
+
+        phase = "Router-Token"
+        token_response = router_session.post(
+            f"{BASE_URL}/cgi-bin/luci/admin/get_token",
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        token_response.raise_for_status()
+        token = token_response.text.strip()
+        if not token:
+            return False, router_session, "Der Router hat kein Login-Token geliefert."
+
+        pass_hash = sha256(passwort + salt)
+        pass_hash = sha256(pass_hash + token)
+        phase = "Router-Login"
+        login_response = router_session.post(
+            f"{BASE_URL}/cgi-bin/luci/",
+            data={
+                "_csrf": csrf,
+                "token": token,
+                "salt": salt,
+                "zonename": "Europe/Berlin",
+                "timeclock": str(int(time.time())),
+                "luci_language": "auto",
+                "luci_username": username,
+                "luci_password": pass_hash,
+            },
+            allow_redirects=False,
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        phase = "geschützte Routerseite"
+        protected_page = router_session.get(
+            f"{BASE_URL}/cgi-bin/luci/admin/network/gcom/sms?iface=4g",
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        login_form = BeautifulSoup(protected_page.text, "html.parser").find(
+            "input", {"name": "luci_password"}
+        )
+
+        if protected_page.status_code == 200 and not login_form:
+            return True, router_session, ""
+
+        reason = (
+            "Der Router zeigt weiterhin das Login-Formular."
+            if login_form
+            else f"Die geschützte Routerseite antwortet mit HTTP {protected_page.status_code}."
+        )
+        return False, router_session, reason
+    except requests.Timeout:
+        return False, router_session, f"Zeitüberschreitung beim Aufruf: {phase}."
+    except requests.HTTPError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        if status_code is not None:
+            return False, router_session, f"Der Router meldet bei {phase} HTTP {status_code}."
+        return False, router_session, f"HTTP-Fehler beim Aufruf: {phase}."
+    except requests.ConnectionError:
+        return False, router_session, f"Die Verbindung zum Router brach bei {phase} ab."
+    except requests.RequestException:
+        return False, router_session, f"Netzwerkfehler beim Aufruf: {phase}."
+
+
+def pruefe_und_speichere_router_passwort(passwort):
+    """Store a replacement credential only after a fresh router login succeeds."""
+    global PASSWORT
+    global session
+
+    router_session = requests.Session()
+    erfolgreich, router_session, grund = pruefe_router_anmeldung(
+        passwort,
+        router_session,
+    )
+    if not erfolgreich:
+        return False, grund
+
+    try:
+        speichere_router_passwort(passwort)
+    except Exception:
+        return False, "Die Anmeldung war erfolgreich, aber Windows konnte das Passwort nicht sicher speichern."
+
+    PASSWORT = passwort
+    session = router_session
+    return True, "Das Passwort wurde geprüft und sicher gespeichert."
+
+
+def aendere_router_admin_passwort(altes_passwort, neues_passwort):
+    """Change the Cudy admin password and persist it only after a fresh login."""
+    global PASSWORT
+    global session
+
+    router_session = requests.Session()
+    angemeldet, router_session, grund = pruefe_router_anmeldung(
+        altes_passwort,
+        router_session,
+    )
+    if not angemeldet:
+        return False, "Das aktuelle Router-Passwort konnte nicht bestätigt werden. " + grund
+
+    try:
+        page = router_session.get(
+            f"{BASE_URL}/cgi-bin/luci/admin/panel",
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        page.raise_for_status()
+    except requests.RequestException:
+        return False, "Die Router-Passwortseite konnte nicht geladen werden."
+
+    soup = BeautifulSoup(page.text, "html.parser")
+    form = soup.find("form", attrs={"name": "cbi"})
+    if not form:
+        return False, "Das Router-Passwortformular wurde auf der Einstellungsseite nicht gefunden."
+
+    action = (form.get("action") or "").strip()
+    if (
+        form.get("method", "get").lower() != "post"
+        or urljoin(BASE_URL + "/", action)
+        != f"{BASE_URL}/cgi-bin/luci/admin/system/password"
+    ):
+        return False, "Das Router-Passwortformular entspricht nicht dem erwarteten Speicher-Endpunkt."
+
+    form_values = {}
+    for field in form.find_all("input"):
+        field_name = field.get("name")
+        if field_name:
+            form_values[field_name] = field.get("value", "")
+
+    required_fields = (
+        "token",
+        "cbid.luci._pass.pw1.salt",
+        "cbid.luci._pass.pw2.salt",
+        "cbid.luci._pass.pw3.salt",
+    )
+    if any(not form_values.get(field) for field in required_fields):
+        return False, "Das Routerformular enthält nicht alle benötigten Sicherheitsfelder."
+
+    passwort_felder = {
+        "cbid.luci._pass.pw1": altes_passwort,
+        "cbid.luci._pass.pw2": neues_passwort,
+        "cbid.luci._pass.pw3": neues_passwort,
+    }
+    for field_name, value in passwort_felder.items():
+        salt = form_values.get(field_name + ".salt", "")
+        if not salt:
+            return False, "Das Routerformular enthält keinen Salt für die Passwortprüfung."
+        form_values[field_name] = value
+        form_values[field_name + ".sha"] = sha256(value + salt)
+
+    form_values["timeclock"] = str(int(time.time()))
+    form_values["cbi.submit"] = "1"
+    form_values["cbi.apply"] = ""
+    action_url = urljoin(BASE_URL + "/", action)
+    multipart_fields = {
+        name: (None, str(value))
+        for name, value in form_values.items()
+    }
+
+    try:
+        response = router_session.post(
+            action_url,
+            files=multipart_fields,
+            timeout=ROUTER_AUTH_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return False, "Der Router hat die Passwortänderung nicht bestätigt. Der App-Speicher blieb unverändert."
+
+    neue_session = requests.Session()
+    bestaetigt, neue_session, grund = pruefe_router_anmeldung(
+        neues_passwort,
+        neue_session,
+    )
+    if not bestaetigt:
+        return False, (
+            "Das Routerformular wurde abgesendet, aber die neue Anmeldung konnte nicht bestätigt werden. "
+            "Das Router-Passwort kann bereits geändert worden sein; der App-Speicher wurde nicht überschrieben. "
+            "Prüfe das neue Passwort im Router und nutze danach „Gespeichertes Passwort aktualisieren“. "
+            + grund
+        )
+
+    try:
+        speichere_router_passwort(neues_passwort)
+    except Exception:
+        PASSWORT = neues_passwort
+        session = neue_session
+        return False, (
+            "Das Router-Passwort wurde geändert und die neue Anmeldung bestätigt, "
+            "konnte aber nicht sicher gespeichert werden. Aktualisiere den App-Speicher, "
+            "bevor du die Anwendung schließt."
+        )
+
+    PASSWORT = neues_passwort
+    session = neue_session
+    return True, "Das Router-Passwort wurde geändert, geprüft und sicher gespeichert."
 
 
 def login():
@@ -1130,6 +1372,9 @@ def sms_id(sms):
 # ============================================================
 
 def lade_sms_state():
+
+    if FIRST_START_TEST_MODE:
+        return {}
 
     if (
         not os.path.exists(SMS_STATE_FILE)
@@ -3048,6 +3293,7 @@ class CudyGUI:
         self._band_test_running = False
         self._band_test_cancel = None
         self._band_dialog = None
+        self._router_passwort_dialog = None
 
         # Einstellungen für die Überwachungsintervalle
         self.poll_interval_var = tk.StringVar(
@@ -3071,7 +3317,7 @@ class CudyGUI:
 
         self.root.after(
             500,
-            self.erster_start_speedtest
+            self.erste_app_einrichtung
         )
 
     # ========================================================
@@ -3977,6 +4223,49 @@ class CudyGUI:
             padx=10
         )
 
+        password_frame = ttk.LabelFrame(
+            router_frame,
+            text="Admin-Passwort",
+            padding=10,
+        )
+        password_frame.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(10, 0),
+        )
+
+        self.router_password_status_label = ttk.Label(
+            password_frame,
+            text=router_passwort_speicherstatus(),
+        )
+        self.router_password_status_label.pack(anchor="w")
+
+        ttk.Label(
+            password_frame,
+            text=(
+                "Du kannst das Router-Passwort hier ändern oder ein bereits "
+                "geändertes Passwort für die App bestätigen."
+            ),
+            wraplength=760,
+        ).pack(anchor="w", pady=(4, 8))
+
+        password_buttons = ttk.Frame(password_frame)
+        password_buttons.pack(anchor="w")
+
+        ttk.Button(
+            password_buttons,
+            text="Router-Passwort ändern",
+            command=lambda: self.router_passwort_dialog("change"),
+        ).pack(side="left")
+
+        ttk.Button(
+            password_buttons,
+            text="Gespeichertes Passwort aktualisieren",
+            command=lambda: self.router_passwort_dialog("update"),
+        ).pack(side="left", padx=(8, 0))
+
         # ----------------------------------------------------
         # SMS
         # ----------------------------------------------------
@@ -4293,10 +4582,20 @@ class CudyGUI:
 
     def starten(self):
 
+        global PASSWORT
         global programm_laeuft
         global backend_thread
 
         if programm_laeuft:
+            return
+
+        if not PASSWORT:
+            PASSWORT = lade_router_passwort()
+        if not PASSWORT:
+            self.router_passwort_dialog(
+                "update",
+                on_success=self.starten,
+            )
             return
 
         programm_laeuft = True
@@ -4320,6 +4619,303 @@ class CudyGUI:
         )
 
         backend_thread.start()
+
+    # ========================================================
+    # ROUTER-PASSWORT
+    # ========================================================
+
+    def router_passwort_dialog(self, modus, on_success=None, on_close=None):
+        if self._router_passwort_dialog is not None:
+            try:
+                self._router_passwort_dialog.lift()
+                self._router_passwort_dialog.focus_force()
+            except tk.TclError:
+                pass
+            return
+
+        if programm_laeuft or self._band_test_running:
+            messagebox.showinfo(
+                "Router-Passwort",
+                "Bitte stoppe zuerst die Überwachung und laufende LTE-Tests.",
+                parent=self.root,
+            )
+            return
+
+        if modus not in ("change", "update"):
+            raise ValueError("Unbekannter Router-Passwortdialog.")
+
+        dialog = tk.Toplevel(self.root)
+        self._router_passwort_dialog = dialog
+        dialog.title(
+            "Router-Passwort ändern"
+            if modus == "change"
+            else "Router-Passwort für die App bestätigen"
+        )
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_dialog())
+
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        if modus == "change":
+            title_text = "Router-Admin-Passwort ändern"
+            help_text = (
+                "Die Änderung wird direkt am Router gespeichert. "
+                "Danach prüft die App die neue Anmeldung und speichert "
+                "das Passwort geschützt für dein Windows-Benutzerkonto."
+            )
+            fields = [
+                ("Aktuelles Passwort", "old"),
+                ("Neues Passwort (8–64 Zeichen)", "new"),
+                ("Neues Passwort bestätigen", "confirm"),
+            ]
+        else:
+            title_text = "Router-Passwort für die App bestätigen"
+            help_text = (
+                "Gib das aktuelle Admin-Passwort ein. Die App prüft die "
+                "Anmeldung am Router und speichert es erst danach geschützt."
+            )
+            fields = [("Aktuelles Router-Passwort", "current")]
+
+        ttk.Label(
+            frame,
+            text=title_text,
+            font=("Segoe UI", 12, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            frame,
+            text=help_text,
+            wraplength=460,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 14))
+
+        entries = {}
+        for row, (label_text, key) in enumerate(fields, start=2):
+            ttk.Label(frame, text=label_text).grid(
+                row=row, column=0, sticky="w", pady=4, padx=(0, 12)
+            )
+            entry = ttk.Entry(frame, show="•", width=34)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            entries[key] = entry
+
+        if modus == "change":
+            gespeichertes_passwort = PASSWORT or lade_router_passwort()
+            if gespeichertes_passwort:
+                entries["old"].insert(0, gespeichertes_passwort)
+
+        status = tk.StringVar(value="")
+        ttk.Label(
+            frame,
+            textvariable=status,
+            wraplength=460,
+        ).grid(row=len(fields) + 2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="e", pady=(14, 0))
+
+        submit_button = ttk.Button(
+            buttons,
+            text="Passwort ändern" if modus == "change" else "Prüfen und speichern",
+        )
+        submit_button.pack(side="right")
+        ttk.Button(
+            buttons,
+            text="Abbrechen",
+            command=lambda: close_dialog(),
+        ).pack(side="right", padx=(0, 8))
+
+        closed = False
+        busy = False
+
+        def close_dialog():
+            nonlocal closed
+            if closed or busy:
+                return
+            closed = True
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+            self._router_passwort_dialog = None
+            if on_close:
+                on_close()
+
+        def submit():
+            nonlocal busy
+            if busy:
+                return
+
+            if modus == "change":
+                old_password = entries["old"].get()
+                new_password = entries["new"].get()
+                confirm_password = entries["confirm"].get()
+                if not old_password:
+                    messagebox.showwarning(
+                        "Passwort fehlt",
+                        "Bitte gib das aktuelle Router-Passwort ein.",
+                        parent=dialog,
+                    )
+                    return
+                if not 8 <= len(new_password) <= 64:
+                    messagebox.showwarning(
+                        "Ungültiges Passwort",
+                        "Das neue Router-Passwort muss 8 bis 64 Zeichen lang sein.",
+                        parent=dialog,
+                    )
+                    return
+                if new_password != confirm_password:
+                    messagebox.showwarning(
+                        "Passwörter stimmen nicht überein",
+                        "Bitte wiederhole das neue Passwort identisch.",
+                        parent=dialog,
+                    )
+                    return
+                if new_password == old_password:
+                    messagebox.showwarning(
+                        "Keine Änderung",
+                        "Das neue Passwort muss sich vom aktuellen Passwort unterscheiden.",
+                        parent=dialog,
+                    )
+                    return
+                task = lambda: aendere_router_admin_passwort(
+                    old_password,
+                    new_password,
+                )
+            else:
+                current_password = entries["current"].get()
+                if not current_password:
+                    messagebox.showwarning(
+                        "Passwort fehlt",
+                        "Bitte gib das aktuelle Router-Passwort ein.",
+                        parent=dialog,
+                    )
+                    return
+                task = lambda: pruefe_und_speichere_router_passwort(
+                    current_password,
+                )
+
+            busy = True
+            status.set("Router-Anmeldung wird geprüft …")
+            submit_button.config(state="disabled")
+            for entry in entries.values():
+                entry.config(state="disabled")
+
+            def worker():
+                try:
+                    outcome = task()
+                except Exception:
+                    outcome = (
+                        False,
+                        "Der Router-Vorgang ist unerwartet fehlgeschlagen. "
+                        "Prüfe die Routerverbindung und versuche es erneut.",
+                    )
+
+                def finish():
+                    nonlocal busy
+                    if closed:
+                        return
+                    busy = False
+                    success, message = outcome
+                    if success:
+                        status.set(message)
+                        if hasattr(self, "router_password_status_label"):
+                            self.router_password_status_label.config(
+                                text=router_passwort_speicherstatus()
+                            )
+                        if on_success:
+                            on_success()
+                        messagebox.showinfo(
+                            "Router-Passwort",
+                            message,
+                            parent=dialog,
+                        )
+                        close_dialog()
+                    else:
+                        status.set(message)
+                        submit_button.config(state="normal")
+                        for entry in entries.values():
+                            entry.config(state="normal")
+                        messagebox.showerror(
+                            "Router-Passwort nicht bestätigt",
+                            message,
+                            parent=dialog,
+                        )
+
+                try:
+                    self.root.after(0, finish)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        submit_button.config(command=submit)
+        dialog.bind("<Return>", lambda _event: submit())
+        dialog.columnconfigure(1, weight=1)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.grab_set()
+        (entries.get("old") or entries.get("current")).focus_set()
+
+    def erste_app_einrichtung(self):
+        global PASSWORT
+
+        if APP_SETTINGS.get("router_password_security_prompt_done"):
+            self.erster_start_speedtest()
+            return
+
+        if not PASSWORT:
+            PASSWORT = lade_router_passwort()
+
+        bereits_geaendert = messagebox.askyesnocancel(
+            "Router-Passwort absichern",
+            "Hast du das werkseitige Admin-Passwort deines Cudy-Routers "
+            "bereits geändert?\n\n"
+            "Ein eigenes Passwort wird für mehr Sicherheit empfohlen.",
+            parent=self.root,
+        )
+
+        def setup_fertigstellen():
+            if not speichere_app_einstellungen({
+                **APP_SETTINGS,
+                "router_password_security_prompt_done": True,
+            }):
+                messagebox.showwarning(
+                    "Hinweis konnte nicht gespeichert werden",
+                    "Die Einrichtung ist abgeschlossen, aber die App konnte "
+                    "die Auswahl nicht für den nächsten Start speichern.",
+                    parent=self.root,
+                )
+
+        if bereits_geaendert is None:
+            self.erster_start_speedtest()
+            return
+
+        if bereits_geaendert:
+            self.router_passwort_dialog(
+                "update",
+                on_success=setup_fertigstellen,
+                on_close=self.erster_start_speedtest,
+            )
+            return
+
+        jetzt_aendern = messagebox.askyesno(
+            "Router-Passwort ändern",
+            "Möchtest du das werkseitige Router-Passwort jetzt ändern?",
+            parent=self.root,
+        )
+        if jetzt_aendern:
+            self.router_passwort_dialog(
+                "change",
+                on_success=setup_fertigstellen,
+                on_close=self.erster_start_speedtest,
+            )
+            return
+
+        setup_fertigstellen()
+        self.erster_start_speedtest()
 
     # ========================================================
     # STOP
@@ -4409,7 +5005,7 @@ class CudyGUI:
     # ========================================================
 
     def erster_start_speedtest(self):
-        if not getattr(sys, "frozen", False):
+        if not getattr(sys, "frozen", False) and not FIRST_START_TEST_MODE:
             return
         profile = lade_lte_profil()
         if profile.get("erststart_speedtest_gezeigt"):
@@ -4949,12 +5545,14 @@ class CudyGUI:
         SESSION_REFRESH_INTERVAL = neuer_session_refresh
         WATCHDOG_TIMEOUT = neuer_watchdog
 
-        if not speichere_app_einstellungen({
+        neue_einstellungen = dict(APP_SETTINGS)
+        neue_einstellungen.update({
             "router_url": BASE_URL,
             "poll_interval": POLL_INTERVAL,
             "session_refresh_interval": SESSION_REFRESH_INTERVAL,
             "watchdog_timeout": WATCHDOG_TIMEOUT,
-        }):
+        })
+        if not speichere_app_einstellungen(neue_einstellungen):
             messagebox.showwarning(
                 "Einstellungen nicht gespeichert",
                 "Die Werte gelten in dieser Sitzung, konnten aber nicht für den "

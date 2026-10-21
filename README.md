@@ -19,6 +19,8 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Optional log Auto-Follow control, enabled by default; turn it off to read or scroll older log entries without being pulled back to the bottom
 - All-band comparison of download throughput, HTTP probe latency, and jitter; the previous band selection is restored after a scan
 - One-time speed-test prompt on the first packaged EXE launch, with a repeatable test in the Signal tab
+- Router admin password can be changed from Settings; the app verifies a fresh login before saving the new password with Windows DPAPI
+- First-run prompt recommends replacing the factory router password and verifies the password entered for the app
 
 ## Requirements
 
@@ -38,11 +40,21 @@ For a local Python setup, create `cudy_credentials.json` from the example (for e
 
 On Windows, the app imports that password on first login into `%LOCALAPPDATA%/CudyAutoRefill/router_password.dpapi`, protected with Windows DPAPI for the current Windows user. The source JSON is intentionally left in place; remove it manually after confirming the app can log in. The app also accepts `CUDY_ROUTER_PASSWORD` from the process environment. Never package or commit credentials.
 
+The Settings tab can change the router's admin password or verify and securely store a password that was changed in the router web interface. Password changes are sent using the router's password form and are saved in the app only after a fresh login with the new password succeeds. Stop SMS monitoring and LTE tests before changing the router password. The first-run prompt recommends changing the factory password; the router does not expose a reliable signal for the app to identify whether it is still using the factory password.
+
 ## Run
 
 ```powershell
 python cudy_auto_refill.py
 ```
+
+To repeat the onboarding flow on every launch, run the separate first-start test launcher:
+
+```powershell
+python cudy_auto_refill_first_start.py
+```
+
+It uses an isolated test data folder, ignores saved passwords and SMS history, and repeats both the router-password onboarding and first-start LTE speed-test prompt. The normal app data remains untouched. The test launcher shares the app's instance lock, so close the normal app before starting it.
 
 The program only starts monitoring after you press Start in the GUI. It can send SMS replies and delete SMS during cleanup, so review the router address and cleanup thresholds before starting it.
 
