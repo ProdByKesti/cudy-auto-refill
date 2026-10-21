@@ -8,6 +8,9 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Incoming SMS polling and trigger matching for sender `80808`, including the Lidl Connect Unlimited 1 GB used-up message
 - Sender fallback for trigger SMS whose number is missing in the inbox list, with sender verification before replying
 - Manual emergency `Refill` SMS to `80808` through the router’s New Message form, with confirmation and outbox verification; live-tested successfully
+- A separate Download tab with temporary faster polling/session-refresh/watchdog values, restored when the mode is switched off
+- Optional proactive `Refill` SMS cycles in Download mode; off by default, explicitly confirmed, and bounded by a minimum 60-second interval, a 12-hour default runtime limit, and a configurable maximum count
+- Proactive cycles share the refill send lock with inbox-triggered and manual sends, wait for an outbox entry, and pause after an unconfirmed result
 - Refill reply verification by checking for a new matching item in the outbox
 - Per-SMS attempt tracking in a local JSON state file
 - Inbox and outbox cleanup when configured message-count thresholds are reached
@@ -66,6 +69,8 @@ It uses an isolated test profile and ignores saved passwords and SMS history. On
 
 In this mode, router access, LTE band changes, SMS sending, refill actions, and SMS cleanup are blocked or simulated. A sample trigger SMS with a missing sender and its outbox confirmation are simulated locally. No credentials, settings, LTE profile, or SMS state are written. The launcher runs the current `cudy_auto_refill.py`, so feature updates stay in sync without maintaining a second copy of the application. It shares the app's instance lock; close the normal app before starting it.
 
+The Download tab is available in both launch paths. In the first-start test launcher, refills remain simulated. In normal mode, Download mode can be switched on or off without restarting the app. Proactive refill SMS require a separate confirmation and are disabled by default. The interval, runtime, and count can be limited in the tab; defaults are 60 seconds, 12 hours, and 20 SMS. A missing outbox confirmation pauses further proactive sends. An outbox entry confirms that the router queued the SMS; it does not prove that Lidl Connect activated another data allowance.
+
 In normal mode, monitoring starts only after you press Start in the GUI. It can send SMS replies and delete SMS during cleanup, so review the router address and cleanup thresholds before starting it. The first-start test launcher blocks those actions.
 
 ## Working copy
@@ -83,6 +88,7 @@ The Log tab's Auto-Follow control starts enabled and keeps new messages in view.
 ## Current limitations
 
 - Polling for refill triggers reads the first inbox page.
+- Download-mode proactive refills verify the router outbox only; they cannot confirm that the carrier activated data or that a long download resumed.
 - The band comparison uses Cloudflare's public download endpoint. It transfers up to about 80 MB across ten bands and does not measure upload speed.
 - The reported latency and jitter are HTTP probe timings; failed probes are shown as request failures, not a dedicated radio packet-loss measurement.
 - Poll interval, session refresh, watchdog, and router URL are stored in the per-user settings file. The Settings tab can export and restore these four values; imports are validated and shown for confirmation before they are applied. Passwords, tokens, SMS content, SMS history, and the first-run prompt state are excluded.
