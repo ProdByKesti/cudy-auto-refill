@@ -560,6 +560,20 @@ def ist_refill_trigger(text):
     )
 
 
+def ist_lidl_absender(phone):
+    """Accept Cudy's short-code value or a labelled form of the same sender."""
+    normalized = normalisiere_sms_text(phone)
+    if not normalized:
+        return True
+
+    digits = re.sub(r"\D", "", normalized)
+    return (
+        digits == LIDL_ABSENDER
+        or normalized == "lidl connect"
+        or re.search(r"(?<!\d)80808(?!\d)", normalized) is not None
+    )
+
+
 REFILL_TEXT = "Refill"
 REFILL_SEND_LOCK = threading.Lock()
 
@@ -1454,6 +1468,54 @@ def sms_element_text(element):
     return max(candidates, key=len, default="")
 
 
+def collapse_repeated_text_halves(text):
+    parts = str(text or "").split()
+    while len(parts) >= 2 and len(parts) % 2 == 0:
+        half = len(parts) // 2
+        if parts[:half] != parts[half:]:
+            break
+        parts = parts[:half]
+    return " ".join(parts)
+
+
+def sms_cell_value(element):
+    """Keep the original visible cell value for stable SMS-state IDs."""
+    if not element:
+        return ""
+    paragraph = element.find("p")
+    if paragraph:
+        return paragraph.get_text(strip=True)
+
+    text = sms_element_text(element)
+    return collapse_repeated_text_halves(text)
+
+
+def finde_sms_feldelement(row, *feldnamen):
+    """Find Cudy SMS fields across both hyphenated and LuCI dotted IDs."""
+    suffixes = tuple(
+        re.compile(rf"(?:^|[._-]){re.escape(name)}$", re.IGNORECASE)
+        for name in feldnamen
+    )
+    for element in row.find_all(attrs={"id": True}):
+        element_id = str(element.get("id") or "")
+        if any(pattern.search(element_id) for pattern in suffixes):
+            return element
+    return None
+
+
+def extrahiere_sms_cfg_aus_row(row):
+    """Read the detail-page CFG from the same Inbox row as the SMS fields."""
+    button = row.find(
+        "button",
+        {
+            "name": lambda value: value and value.endswith(".readsms")
+        },
+    )
+    if not button:
+        return None
+    return extrahiere_cfg(button.get("onclick", ""))
+
+
 def lese_sms(html):
     soup = BeautifulSoup(
         html,
@@ -1466,56 +1528,48 @@ def lese_sms(html):
 
     bereits_gefunden = set()
 
-    for row in rows:
+    for row_index, row in enumerate(rows, start=1):
 
-        phone_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-phone"
-            )
+        phone_element = finde_sms_feldelement(
+            row, "phone", "sender", "number"
         )
 
-        content_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-content"
-            )
+        content_element = finde_sms_feldelement(
+            row, "content", "message", "text"
         )
 
-        timestamp_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-timestamp"
-            )
+        timestamp_element = finde_sms_feldelement(
+            row, "timestamp", "time", "date"
         )
 
         if not content_element:
             continue
 
-        if not timestamp_element:
-            continue
+        phone = sms_cell_value(phone_element)
+        content = sms_element_text(content_element)
+        timestamp = sms_cell_value(timestamp_element)
 
-        phone = phone_element.find("p") if phone_element else None
-        content = content_element.find("p")
-        timestamp = timestamp_element.find("p")
+        # Some Cudy firmware revisions omit the timestamp field from a row.
+        # Keep that SMS processable and use its stable row/field ID as identity.
+        if not timestamp:
+            timestamp = (
+                str(row.get("data-timestamp") or row.get("data-id") or "")
+                or str(row.get("id") or "")
+                or str(content_element.get("id") or "")
+                or f"row-{row_index}-{hashlib.sha256(str(row).encode('utf-8')).hexdigest()[:12]}"
+            )
 
         if not content:
             continue
 
-        if not timestamp:
-            continue
-
         sms = {
-            "phone":
-                phone.get_text(strip=True) if phone else "",
+            "phone": phone,
 
-            "content":
-                sms_element_text(content_element),
+            "content": content,
 
-            "timestamp":
-                timestamp.get_text(
-                    strip=True
-                )
+            "timestamp": timestamp,
+
+            "cfg": extrahiere_sms_cfg_aus_row(row),
         }
 
         identifikation = sms_id(
@@ -1553,66 +1607,11 @@ def lese_sms_mit_cfg(html):
     rows = soup.find_all("tr")
 
     for row in rows:
-
-        phone_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-phone"
-            )
-        )
-
-        content_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-content"
-            )
-        )
-
-        timestamp_element = row.find(
-            id=lambda value:
-            value and value.endswith(
-                "-timestamp"
-            )
-        )
-
-        if not content_element:
+        parsed_rows = lese_sms(str(row))
+        if not parsed_rows:
             continue
-
-        if not timestamp_element:
-            continue
-
-        phone = phone_element.find("p") if phone_element else None
-        content = content_element.find("p")
-        timestamp = timestamp_element.find("p")
-
-        if not content:
-            continue
-
-        if not timestamp:
-            continue
-
-        phone_text = phone.get_text(strip=True) if phone else ""
-
-        content_text = sms_element_text(content_element)
-
-        timestamp_text = timestamp.get_text(
-            strip=True
-        )
-
-        sms = {
-            "phone":
-                phone_text,
-
-            "content":
-                content_text,
-
-            "timestamp":
-                timestamp_text
-        }
-
-        identifikation = sms_id(
-            sms
-        )
+        sms = parsed_rows[0]
+        identifikation = sms_id(sms)
 
         if identifikation in bereits_gefunden:
             continue
@@ -2551,6 +2550,26 @@ def aktualisiere_sms_state(
     )
 
     if identifikation not in state:
+        # Reconcile states created by router markup that duplicated the sender
+        # or timestamp in tooltip text, so a parser correction cannot reset a
+        # previous attempt/success and send a second refill for the same SMS.
+        for alte_identifikation, alter_eintrag in list(state.items()):
+            if not isinstance(alter_eintrag, dict):
+                continue
+            if (
+                alter_eintrag.get("content", "") == sms["content"]
+                and collapse_repeated_text_halves(
+                    alter_eintrag.get("phone", "")
+                ) == sms["phone"]
+                and collapse_repeated_text_halves(
+                    alter_eintrag.get("timestamp", "")
+                ) == sms["timestamp"]
+            ):
+                state.pop(alte_identifikation, None)
+                state[identifikation] = alter_eintrag
+                break
+
+    if identifikation not in state:
 
         state[identifikation] = {
             "phone":
@@ -2574,6 +2593,18 @@ def aktualisiere_sms_state(
             "last_attempt":
                 0,
 
+            "detail_checked":
+                False,
+
+            "detail_lookup_attempts":
+                0,
+
+            "detail_trigger_found":
+                False,
+
+            "trigger_observations":
+                0,
+
             "created":
                 time.time()
         }
@@ -2581,6 +2612,13 @@ def aktualisiere_sms_state(
     eintrag = state[
         identifikation
     ]
+
+    # Older state files predate full-message lookup; keep those SMS eligible
+    # for one safe detail-page check without resetting their refill history.
+    eintrag.setdefault("detail_checked", False)
+    eintrag.setdefault("detail_lookup_attempts", 0)
+    eintrag.setdefault("detail_trigger_found", False)
+    eintrag.setdefault("trigger_observations", 0)
 
     eintrag[
         "read_count"
@@ -2617,16 +2655,61 @@ def verarbeite_sms_liste(
             )
         )
 
-        if sms["phone"] and sms["phone"] != LIDL_ABSENDER:
+        if not ist_lidl_absender(sms["phone"]):
             continue
 
         # ====================================================
         # NEUER REFILL-TRIGGER-POOL
         # ====================================================
 
-        trigger_gefunden = ist_refill_trigger(sms["content"])
+        trigger_gefunden = (
+            ist_refill_trigger(sms["content"])
+            or eintrag.get("detail_trigger_found", False)
+        )
+
+        # Inbox rows can expose only a clipped preview. If that preview did
+        # not match, read the full text from the detail page using the CFG
+        # attached to this exact row. The poll itself remains page-1-only.
+        if (
+            not trigger_gefunden
+            and not FIRST_START_TEST_MODE
+            and not eintrag.get("detail_checked", False)
+            and eintrag.get("detail_lookup_attempts", 0) < 3
+        ):
+            detail_cfg = sms.get("cfg") or finde_cfg_fuer_sms(html, sms)
+            if detail_cfg:
+                eintrag["detail_lookup_attempts"] += 1
+                speichere_sms_state(state)
+                try:
+                    detail_sender, detail_content = hole_sms_detailinhalt(detail_cfg)
+                except PermissionError:
+                    raise
+                except Exception:
+                    detail_sender, detail_content = "", ""
+
+                if detail_content:
+                    eintrag["detail_checked"] = True
+                    if (
+                        detail_sender
+                        and ist_lidl_absender(detail_sender)
+                        and ist_refill_trigger(detail_content)
+                    ):
+                        eintrag["detail_trigger_found"] = True
+                        trigger_gefunden = True
+                elif eintrag["detail_lookup_attempts"] >= 3:
+                    eintrag["detail_checked"] = True
+                    print(
+                        "SMS-Detailtext konnte nach drei Versuchen nicht gelesen werden; "
+                        "für diese SMS wurde kein Refill ausgelöst."
+                    )
+
+                speichere_sms_state(state)
 
         if not trigger_gefunden:
+            if eintrag["read_count"] == 1:
+                print(
+                    "Neue SMS in der Inbox erkannt; Text passt nicht zu einem Refill-Trigger."
+                )
             continue
 
         aktions_id = identifikation[:8].upper()
@@ -2690,27 +2773,6 @@ def verarbeite_sms_liste(
 
             continue
 
-        if eintrag["read_count"] > 2:
-
-            log_refill_aktion(
-                aktions_id,
-                "ENTSCHEIDUNG",
-                "Kein weiterer Versuch: die Beobachtungsgrenze ist erreicht.",
-            )
-
-            print(
-                "   SMS wurde bereits "
-                "mehrfach geprüft."
-            )
-
-            if eintrag["refill_attempts"] >= 2:
-
-                print(
-                    "   Maximale Refill-Versuche erreicht."
-                )
-
-            continue
-
         if eintrag["refill_attempts"] >= 2:
 
             log_refill_aktion(
@@ -2728,7 +2790,7 @@ def verarbeite_sms_liste(
         cfg = (
             "SIMULIERT"
             if FIRST_START_TEST_MODE
-            else finde_cfg_fuer_sms(html, sms)
+            else sms.get("cfg") or finde_cfg_fuer_sms(html, sms)
         )
 
         if not cfg:
@@ -2750,6 +2812,27 @@ def verarbeite_sms_liste(
                 "und wird erneut geprüft."
             )
 
+            continue
+
+        # read_count includes every inbox poll, including polls when the SMS
+        # was not yet classified as a trigger. Only count eligible trigger
+        # checks after the matching router CFG is available.
+        eintrag["trigger_observations"] += 1
+        speichere_sms_state(state)
+        print(
+            "   Trigger-Prüfungen:",
+            eintrag["trigger_observations"]
+        )
+
+        if eintrag["trigger_observations"] > 2:
+            log_refill_aktion(
+                aktions_id,
+                "ENTSCHEIDUNG",
+                "Kein weiterer Versuch: die Trigger-Prüfungsgrenze ist erreicht.",
+            )
+            print(
+                "   SMS wurde bereits mehrfach als Refill-Trigger geprüft."
+            )
             continue
 
         print(
@@ -2871,7 +2954,7 @@ def verarbeite_sms_liste(
             )
 
             if (
-                eintrag["read_count"] < 2
+                eintrag["trigger_observations"] < 2
                 and eintrag["refill_attempts"] < 2
             ):
 
@@ -2906,6 +2989,11 @@ def finde_cfg_fuer_sms(
     html,
     sms
 ):
+    # Prefer the CFG extracted from the exact table row. Re-parsing the whole
+    # table can produce a different fallback timestamp on some firmware.
+    if sms.get("cfg"):
+        return sms["cfg"]
+
     sms_liste = lese_sms_mit_cfg(
         html
     )
@@ -2935,6 +3023,71 @@ def finde_cfg_fuer_sms(
         return None
 
     return passende_sms[0]["cfg"]
+
+
+def hole_sms_detailinhalt(cfg):
+    """Fetch the full Inbox message from its Cudy detail form."""
+    if not cfg:
+        return "", ""
+
+    details_url = (
+        f"{BASE_URL}"
+        "/cgi-bin/luci/admin/network/gcom/sms/"
+        f"readsms?iface=4g&cfg={cfg}&smsbox=rec"
+    )
+    headers = {
+        **HEADERS,
+        "Referer": (
+            f"{BASE_URL}"
+            "/cgi-bin/luci/admin/network/gcom/sms/"
+            "smslist?smsbox=rec&iface=4g"
+        ),
+    }
+
+    response = session.get(
+        details_url,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code == 403:
+        raise PermissionError("Cudy Session beim Lesen der SMS-Details abgelaufen.")
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    form = soup.find("form", {"name": "cbi"})
+    if not form:
+        return "", ""
+
+    phone_field = form.find("input", {"name": "cbid.smsread.1.phone"})
+    sender = phone_field.get("value", "").strip() if phone_field else ""
+
+    content_field = form.find(
+        ["input", "textarea"],
+        {"name": "cbid.smsread.1.content"},
+    )
+    if not content_field:
+        content_field = finde_sms_feldelement(form, "content", "message", "text")
+
+    if not content_field:
+        return sender, ""
+
+    if content_field.name == "textarea":
+        content = content_field.get_text(" ", strip=True)
+    else:
+        content = str(content_field.get("value") or "").strip()
+
+    if not content:
+        # Some firmware renders the received SMS as visible page text instead
+        # of filling the reply form's content field.
+        page_body = soup.body or soup
+        content = page_body.get_text(" ", strip=True)
+
+    # Never use a detail form with a missing or unrelated sender as evidence
+    # for a refill trigger.
+    if not sender or not ist_lidl_absender(sender):
+        return sender, ""
+
+    return sender, content
 
 
 # ============================================================
@@ -3474,14 +3627,13 @@ def poll():
         gui_status("inbox", "1 (simuliert)")
         return verarbeite_sms_liste([sms], "")
 
-    html = hole_sms_seite(
-        "rec",
-        1
-    )
+    html = hole_sms_seite("rec", 1)
+    sms_liste = lese_sms(html)
 
-    sms_liste = lese_sms(
-        html
-    )
+    if not sms_liste and BeautifulSoup(html, "html.parser").find("tr"):
+        print(
+            "SMS-Parser-Warnung: Inbox-Tabelle gefunden, aber keine SMS-Einträge erkannt."
+        )
 
     letzter_erfolgreicher_poll = (
         time.monotonic()
@@ -3498,14 +3650,11 @@ def poll():
         str(len(sms_liste))
     )
 
-    print(
-        f"Poll OK | "
-        f"Inbox Seite 1: {len(sms_liste)} SMS"
-    )
+    print(f"Poll OK | Inbox Seite 1: {len(sms_liste)} SMS")
 
     geschützte_sms = verarbeite_sms_liste(
         sms_liste,
-        html
+        html,
     )
 
     pruefe_offene_outbox_bestaetigung()
