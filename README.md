@@ -13,7 +13,7 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - Proactive cycles share the refill send lock with inbox-triggered and manual sends, wait for an outbox entry, and pause after an unconfirmed result
 - Refill reply verification by checking for a new matching item in the outbox
 - Per-SMS attempt tracking in a local JSON state file
-- Inbox and outbox cleanup when configured message-count thresholds are reached
+- Inbox and outbox cleanup when configured message-count thresholds are reached; mailbox pages are scanned at startup and then every five minutes (with a shorter retry after cleanup errors)
 - Session refresh and watchdog recovery with capped retry backoff
 - Manual LTE band selection with internet verification and automatic rollback if the connection does not recover
 - OS-level instance lock so a second copy exits before starting another polling or refill loop

@@ -564,6 +564,12 @@ REFILL_TEXT = "Refill"
 REFILL_SEND_LOCK = threading.Lock()
 
 
+def ist_refill_outbox_text(text):
+    """Accept the router's SMS label with repeated tooltip text, but no extra words."""
+    tokens = re.findall(r"\w+", normalisiere_sms_text(text), flags=re.UNICODE)
+    return bool(tokens) and all(token == REFILL_TEXT.casefold() for token in tokens)
+
+
 def log_refill_aktion(aktions_id, schritt, details):
     """Write one redaction-safe, correlatable refill event to the app log."""
     print(f"Refill-Aktion [{aktions_id}] | {schritt} | {details}")
@@ -579,6 +585,8 @@ OUTBOX_CLEANUP_START = 50
 OUTBOX_CLEANUP_TARGET = 40
 
 DELETE_WAIT = 1
+CLEANUP_INTERVAL_SECONDS = 300
+CLEANUP_RETRY_SECONDS = 30
 
 
 # ============================================================
@@ -589,6 +597,35 @@ log_queue = queue.Queue()
 
 programm_laeuft = False
 backend_thread = None
+ACTIVE_WORKER_THREADS = set()
+ACTIVE_WORKER_THREADS_LOCK = threading.Lock()
+naechster_cleanup_at = 0.0
+
+
+def starte_hintergrund_thread(target, *, name=None):
+    """Start a daemon worker and keep it tracked until its work has finished."""
+    def tracked_target():
+        try:
+            target()
+        finally:
+            with ACTIVE_WORKER_THREADS_LOCK:
+                ACTIVE_WORKER_THREADS.discard(threading.current_thread())
+
+    worker = threading.Thread(target=tracked_target, name=name, daemon=True)
+    with ACTIVE_WORKER_THREADS_LOCK:
+        ACTIVE_WORKER_THREADS.add(worker)
+    try:
+        worker.start()
+    except Exception:
+        with ACTIVE_WORKER_THREADS_LOCK:
+            ACTIVE_WORKER_THREADS.discard(worker)
+        raise
+    return worker
+
+
+def aktive_hintergrund_threads():
+    with ACTIVE_WORKER_THREADS_LOCK:
+        return [worker for worker in ACTIVE_WORKER_THREADS if worker.is_alive()]
 
 status_data = {
     "status": "Gestoppt",
@@ -2010,9 +2047,7 @@ def outbox_snapshot():
             ):
                 continue
 
-            if normalisiere_sms_text(sms["content"]) != normalisiere_sms_text(
-                REFILL_TEXT
-            ):
+            if not ist_refill_outbox_text(sms["content"]):
                 continue
 
             snapshot.add(
@@ -3176,6 +3211,9 @@ def cleanup(
     if geschützte_sms is None:
         geschützte_sms = set()
 
+    if FIRST_START_TEST_MODE:
+        return True
+
     try:
 
         cleanup_smsbox(
@@ -3191,6 +3229,7 @@ def cleanup(
             OUTBOX_CLEANUP_TARGET,
             set()
         )
+        return True
 
     except PermissionError:
 
@@ -3208,6 +3247,7 @@ def cleanup(
             "Cleanup-Fehler:",
             e
         )
+        return False
 
 
 def pruefe_download_refill_plan():
@@ -3391,7 +3431,7 @@ def pruefe_download_refill_plan():
                 )
 
     try:
-        threading.Thread(target=worker, daemon=True).start()
+        starte_hintergrund_thread(worker, name="cudy-download-refill")
         print(
             "Download-Modus: proaktiver Refill gestartet "
             f"({DOWNLOAD_PROACTIVE_ATTEMPTS}/{DOWNLOAD_PROACTIVE_MAX_REFILLS})."
@@ -3520,6 +3560,10 @@ def hauptschleife():
     global letzter_session_refresh
     global letzter_erfolgreicher_poll
     global poll_fehler
+    global naechster_cleanup_at
+
+    # Cleanup runs on the first successful loop and then at a bounded interval.
+    naechster_cleanup_at = 0.0
 
     print()
 
@@ -3578,6 +3622,10 @@ def hauptschleife():
         f"Outbox Cleanup: "
         f"{OUTBOX_CLEANUP_START} → "
         f"{OUTBOX_CLEANUP_TARGET}"
+    )
+
+    print(
+        f"Cleanup-Intervall: {CLEANUP_INTERVAL_SECONDS} Sekunden"
     )
 
     print(
@@ -3867,22 +3915,20 @@ def hauptschleife():
             # CLEANUP
             # =================================================
 
-            try:
+            if time.monotonic() >= naechster_cleanup_at:
+                cleanup_erfolgreich = False
+                try:
+                    cleanup_erfolgreich = cleanup(geschützte_sms)
+                except PermissionError:
+                    print()
+                    print("Cleanup benötigt neue Session.")
+                    session_recovery()
 
-                cleanup(
-                    geschützte_sms
+                naechster_cleanup_at = time.monotonic() + (
+                    CLEANUP_INTERVAL_SECONDS
+                    if cleanup_erfolgreich
+                    else CLEANUP_RETRY_SECONDS
                 )
-
-            except PermissionError:
-
-                print()
-
-                print(
-                    "Cleanup benötigt "
-                    "neue Session."
-                )
-
-                session_recovery()
 
             pruefe_download_refill_plan()
 
@@ -3979,6 +4025,8 @@ class CudyGUI:
         )
 
         self.labels = {}
+        self._closing = False
+        self._shutdown_wait_notice_written = False
         self._band_test_running = False
         self._band_test_cancel = None
         self._band_dialog = None
@@ -5553,6 +5601,12 @@ class CudyGUI:
         if programm_laeuft:
             return
 
+        if aktive_hintergrund_threads():
+            print(
+                "Start wartet, bis vorherige Hintergrundaktionen beendet sind."
+            )
+            return
+
         if FIRST_START_TEST_MODE:
             FIRST_START_TEST_LOGIN_ATTEMPTS = 0
             FIRST_START_TEST_POLL_DONE = False
@@ -5582,12 +5636,17 @@ class CudyGUI:
             "Starte..."
         )
 
-        backend_thread = threading.Thread(
-            target=hauptschleife,
-            daemon=True
-        )
-
-        backend_thread.start()
+        try:
+            backend_thread = starte_hintergrund_thread(
+                hauptschleife,
+                name="cudy-backend",
+            )
+        except Exception as exc:
+            programm_laeuft = False
+            self.start_button.config(state="normal")
+            self.stop_button.config(state="disabled")
+            gui_status("status", "Gestoppt")
+            print("Backend-Thread konnte nicht gestartet werden:", exc)
 
     # ========================================================
     # ROUTER-PASSWORT
@@ -5822,7 +5881,7 @@ class CudyGUI:
                 except tk.TclError:
                     pass
 
-            threading.Thread(target=worker, daemon=True).start()
+            starte_hintergrund_thread(worker, name="cudy-password-update")
 
         submit_button.config(command=submit)
         dialog.bind("<Return>", lambda _event: submit())
@@ -5921,6 +5980,9 @@ class CudyGUI:
         self.stop_button.config(
             state="disabled"
         )
+        self.start_button.config(
+            state="disabled"
+        )
 
     # ========================================================
     # SMS AKTUALISIEREN
@@ -5972,10 +6034,7 @@ class CudyGUI:
                     e
                 )
 
-        threading.Thread(
-            target=worker,
-            daemon=True
-        ).start()
+        starte_hintergrund_thread(worker, name="cudy-sms-refresh")
 
     # ========================================================
     # SIGNAL AKTUALISIEREN
@@ -6162,7 +6221,7 @@ class CudyGUI:
             except tk.TclError:
                 pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        starte_hintergrund_thread(worker, name="cudy-band-speedtest")
 
     # ========================================================
     # SIGNAL AKTUALISIEREN
@@ -6193,7 +6252,7 @@ class CudyGUI:
             except tk.TclError:
                 pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        starte_hintergrund_thread(worker, name="cudy-band-refresh")
 
     # ========================================================
     # TEST REFILL
@@ -6358,7 +6417,7 @@ class CudyGUI:
                 except tk.TclError:
                     pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        starte_hintergrund_thread(worker, name="cudy-manual-refill")
 
     def download_modus_umschalten(self):
         global DOWNLOAD_MODE_ACTIVE
@@ -6872,10 +6931,10 @@ class CudyGUI:
                 except tk.TclError:
                     pass
 
-            threading.Thread(target=apply_worker, daemon=True).start()
+            starte_hintergrund_thread(apply_worker, name="cudy-band-apply")
 
         apply_button.config(command=apply_selection)
-        threading.Thread(target=load_worker, daemon=True).start()
+        starte_hintergrund_thread(load_worker, name="cudy-band-load")
 
     # ========================================================
     # EINSTELLUNGEN SPEICHERN
@@ -7297,7 +7356,17 @@ class CudyGUI:
 
         global programm_laeuft
 
-        if not programm_laeuft:
+        aktive_worker = aktive_hintergrund_threads()
+
+        if programm_laeuft:
+            self.start_button.config(state="disabled")
+            self.stop_button.config(state="normal")
+
+        elif aktive_worker:
+            self.start_button.config(state="disabled")
+            self.stop_button.config(state="disabled")
+
+        else:
 
             self.start_button.config(
                 state="normal"
@@ -7337,6 +7406,13 @@ class CudyGUI:
 
         global programm_laeuft
 
+        if self._closing:
+            return
+
+        self._closing = True
+        self.start_button.config(state="disabled")
+        self.stop_button.config(state="disabled")
+
         self.download_modus_beenden(grund="App geschlossen")
 
         if programm_laeuft:
@@ -7348,6 +7424,21 @@ class CudyGUI:
             print(
                 "Cudy Auto Refill wird beendet..."
             )
+
+        self._warte_auf_worker_vor_schliessen()
+
+    def _warte_auf_worker_vor_schliessen(self):
+        if aktive_hintergrund_threads():
+            if not self._shutdown_wait_notice_written:
+                print(
+                    "Warte auf laufende Router-Aktionen, bevor die App geschlossen wird..."
+                )
+                self._shutdown_wait_notice_written = True
+            try:
+                self.root.after(100, self._warte_auf_worker_vor_schliessen)
+            except tk.TclError:
+                pass
+            return
 
         self.root.destroy()
 

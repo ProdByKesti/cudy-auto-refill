@@ -152,7 +152,12 @@ class SMSFixtureRegressionTests(unittest.TestCase):
                     ):
                         protected = app.verarbeite_sms_liste(parsed, html)
 
-            refill.assert_called_once_with(message["cfg"])
+            refill.assert_called_once()
+            self.assertEqual(refill.call_args.args[0], message["cfg"])
+            self.assertEqual(
+                refill.call_args.args[1], app.sms_id(parsed[0])[:8].upper()
+            )
+            self.assertEqual(refill.call_args.args[2], app.sms_id(parsed[0]))
             send_reply.assert_not_called()
             send_new_sms.assert_not_called()
             network_request.assert_not_called()
@@ -183,7 +188,12 @@ class SMSFixtureRegressionTests(unittest.TestCase):
                         app.verarbeite_sms_liste(parsed, html)
                         app.verarbeite_sms_liste(parsed, html)
 
-            refill.assert_called_once_with(message["cfg"])
+            refill.assert_called_once()
+            self.assertEqual(refill.call_args.args[0], message["cfg"])
+            self.assertEqual(
+                refill.call_args.args[1], app.sms_id(parsed[0])[:8].upper()
+            )
+            self.assertEqual(refill.call_args.args[2], app.sms_id(parsed[0]))
             send_reply.assert_not_called()
             send_new_sms.assert_not_called()
             network_request.assert_not_called()
@@ -214,7 +224,9 @@ class SMSFixtureRegressionTests(unittest.TestCase):
                     side_effect=AssertionError("Network disabled in fixture tests"),
                 ) as network_request,
             ):
-                confirmed = app.refill_versuch("fixture-cfg-fast")
+                confirmed = app.refill_versuch(
+                    "fixture-cfg-fast", "FIXTURE-ACTION"
+                )
 
         self.assertFalse(confirmed)
         send_reply.assert_called_once_with("fixture-cfg-fast", app.REFILL_TEXT)
@@ -231,6 +243,8 @@ class SMSFixtureRegressionTests(unittest.TestCase):
         old_message["phone"] = old_message["sender"]
         new_message = dict(
             old_message,
+            content="Refill Refill",
+            preview="Refill",
             timestamp="FIXTURE_OUTBOX_NEW",
             cfg="fixture-cfg-outbox-new",
         )
