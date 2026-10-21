@@ -14,8 +14,8 @@ import unicodedata
 import uuid
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
-from tkinter import ttk, messagebox
-from urllib.parse import urljoin
+from tkinter import ttk, messagebox, filedialog
+from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 from lte_features import (
     LTE_BANDS,
@@ -143,6 +143,102 @@ def speichere_app_einstellungen(value):
     except OSError as exc:
         print("Einstellungen konnten nicht gespeichert werden:", exc)
         return False
+
+
+SETTINGS_EXPORT_FORMAT = "cudy-auto-refill-settings"
+SETTINGS_EXPORT_VERSION = 1
+SETTINGS_EXPORT_KEYS = (
+    "router_url",
+    "poll_interval",
+    "session_refresh_interval",
+    "watchdog_timeout",
+)
+SETTINGS_EXPORT_INTERVALS = {
+    "poll_interval": {5, 10, 15, 30, 60, 120, 300},
+    "session_refresh_interval": {0, 60, 120, 300, 600, 900, 1800, 3600},
+    "watchdog_timeout": {0, 30, 45, 60, 90, 120, 180, 300},
+}
+
+
+def validiere_router_basis_url(wert):
+    if not isinstance(wert, str) or not wert.strip() or len(wert) > 2048:
+        raise ValueError("Die Router-Adresse fehlt oder ist zu lang.")
+
+    try:
+        parsed = urlsplit(wert.strip())
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Die Router-Adresse ist ungültig.") from exc
+
+    if (
+        parsed.scheme.lower() not in ("http", "https")
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "Die Router-Adresse muss eine HTTP- oder HTTPS-Basisadresse ohne Zugangsdaten sein."
+        )
+
+    return f"{parsed.scheme.lower()}://{parsed.netloc}".rstrip("/")
+
+
+def validiere_einstellungen_werte(einstellungen):
+    if not isinstance(einstellungen, dict):
+        raise ValueError("Die Einstellungsdaten haben ein ungültiges Format.")
+
+    if set(einstellungen) != set(SETTINGS_EXPORT_KEYS):
+        raise ValueError(
+            "Die Datei enthält fehlende oder nicht unterstützte Einstellungen."
+        )
+
+    result = {
+        "router_url": validiere_router_basis_url(einstellungen["router_url"]),
+    }
+    for name, erlaubte_werte in SETTINGS_EXPORT_INTERVALS.items():
+        wert = einstellungen[name]
+        if type(wert) is not int or wert not in erlaubte_werte:
+            raise ValueError("Die Datei enthält ein ungültiges Überwachungsintervall.")
+        result[name] = wert
+
+    return result
+
+
+def validiere_einstellungen_export(daten):
+    if not isinstance(daten, dict) or set(daten) != {"format", "version", "settings"}:
+        raise ValueError("Die Datei ist kein unterstützter Cudy-Einstellungsexport.")
+    if daten.get("format") != SETTINGS_EXPORT_FORMAT:
+        raise ValueError("Die Datei ist kein Cudy-Einstellungsexport.")
+    if type(daten.get("version")) is not int or daten["version"] != SETTINGS_EXPORT_VERSION:
+        raise ValueError("Diese Exportversion wird von der App nicht unterstützt.")
+    return validiere_einstellungen_werte(daten.get("settings"))
+
+
+def sekunden_aus_text(wert):
+    if wert == "Aus":
+        return 0
+
+    try:
+        zahl = int(wert.split()[0])
+    except (AttributeError, IndexError, ValueError) as exc:
+        raise ValueError("Ein Überwachungsintervall ist ungültig.") from exc
+
+    if "Minute" in wert:
+        return zahl * 60
+    return zahl
+
+
+def intervall_als_text(sekunden, einheit):
+    if sekunden == 0:
+        return "Aus"
+    if einheit == "minuten":
+        minuten = sekunden // 60
+        return f"{minuten} Minute" if minuten == 1 else f"{minuten} Minuten"
+    return f"{sekunden} Sekunden"
 
 
 class _DataBlob(ctypes.Structure):
@@ -4473,6 +4569,44 @@ class CudyGUI:
         )
 
         # ----------------------------------------------------
+        # EINSTELLUNGEN ÜBERTRAGEN
+        # ----------------------------------------------------
+
+        settings_transfer_frame = ttk.LabelFrame(
+            tab,
+            text="Einstellungen übertragen",
+            padding=15,
+        )
+        settings_transfer_frame.pack(
+            fill="x",
+            pady=(15, 0),
+        )
+
+        ttk.Label(
+            settings_transfer_frame,
+            text=(
+                "Der Export enthält nur Router-Adresse und Überwachungsintervalle. "
+                "Passwörter, Tokens, SMS-Inhalte und SMS-Verlauf werden nicht übertragen."
+            ),
+            wraplength=800,
+        ).pack(anchor="w")
+
+        settings_transfer_buttons = ttk.Frame(settings_transfer_frame)
+        settings_transfer_buttons.pack(anchor="w", pady=(8, 0))
+
+        ttk.Button(
+            settings_transfer_buttons,
+            text="Einstellungen exportieren",
+            command=self.einstellungen_exportieren,
+        ).pack(side="left")
+
+        ttk.Button(
+            settings_transfer_buttons,
+            text="Einstellungen importieren",
+            command=self.einstellungen_importieren,
+        ).pack(side="left", padx=(8, 0))
+
+        # ----------------------------------------------------
         # SPEICHERN
         # ----------------------------------------------------
 
@@ -5509,7 +5643,137 @@ class CudyGUI:
     # EINSTELLUNGEN SPEICHERN
     # ========================================================
 
-    def einstellungen_speichern(self):
+    def einstellungen_exportieren(self):
+        try:
+            einstellungen = validiere_einstellungen_werte({
+                "router_url": self.router_entry.get().strip() or BASE_URL,
+                "poll_interval": sekunden_aus_text(self.poll_interval_var.get()),
+                "session_refresh_interval": sekunden_aus_text(
+                    self.session_refresh_var.get()
+                ),
+                "watchdog_timeout": sekunden_aus_text(self.watchdog_var.get()),
+            })
+        except ValueError as exc:
+            messagebox.showerror(
+                "Einstellungen können nicht exportiert werden",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        dateipfad = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Einstellungen exportieren",
+            defaultextension=".json",
+            initialfile="cudy-auto-refill-settings.json",
+            filetypes=[("Cudy-Einstellungen", "*.json"), ("Alle Dateien", "*.*")],
+        )
+        if not dateipfad:
+            return
+
+        geschuetzte_pfade = {
+            os.path.normcase(os.path.abspath(pfad))
+            for pfad in (
+                SETTINGS_FILE,
+                CREDENTIALS_FILE,
+                SMS_STATE_FILE,
+                LTE_PROFILE_FILE,
+                APP_LOG_FILE,
+                LEGACY_SMS_STATE_FILE,
+                *LEGACY_CREDENTIAL_FILES,
+            )
+            if pfad
+        }
+        if os.path.normcase(os.path.abspath(dateipfad)) in geschuetzte_pfade:
+            messagebox.showerror(
+                "Export fehlgeschlagen",
+                "Diese Datei wird von der App verwendet und darf nicht überschrieben werden. "
+                "Bitte wähle einen anderen Speicherort.",
+                parent=self.root,
+            )
+            return
+
+        export = {
+            "format": SETTINGS_EXPORT_FORMAT,
+            "version": SETTINGS_EXPORT_VERSION,
+            "settings": einstellungen,
+        }
+        try:
+            with open(dateipfad, "w", encoding="utf-8") as datei:
+                json.dump(export, datei, ensure_ascii=False, indent=2)
+                datei.write("\n")
+        except OSError:
+            messagebox.showerror(
+                "Export fehlgeschlagen",
+                "Die Einstellungsdatei konnte nicht gespeichert werden.",
+                parent=self.root,
+            )
+            return
+
+        messagebox.showinfo(
+            "Export abgeschlossen",
+            "Die Einstellungen wurden exportiert. Passwörter, Tokens und SMS-Daten "
+            "sind nicht enthalten.",
+            parent=self.root,
+        )
+
+    def einstellungen_importieren(self):
+        if programm_laeuft or self._band_test_running:
+            messagebox.showinfo(
+                "Import gerade nicht möglich",
+                "Bitte stoppe zuerst die Überwachung und laufende LTE-Tests.",
+                parent=self.root,
+            )
+            return
+
+        dateipfad = filedialog.askopenfilename(
+            parent=self.root,
+            title="Einstellungen importieren",
+            filetypes=[("Cudy-Einstellungen", "*.json"), ("Alle Dateien", "*.*")],
+        )
+        if not dateipfad:
+            return
+
+        try:
+            if os.path.getsize(dateipfad) > 64 * 1024:
+                raise ValueError("Die Einstellungsdatei ist zu groß.")
+            with open(dateipfad, "r", encoding="utf-8") as datei:
+                importierte_einstellungen = validiere_einstellungen_export(
+                    json.load(datei)
+                )
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            messagebox.showerror(
+                "Import fehlgeschlagen",
+                f"Die Datei wurde nicht angewendet. {exc}",
+                parent=self.root,
+            )
+            return
+
+        zusammenfassung = (
+            f"Router-Adresse: {importierte_einstellungen['router_url']}\n"
+            f"Poll-Intervall: {intervall_als_text(importierte_einstellungen['poll_interval'], 'sekunden')}\n"
+            f"Session-Refresh: {intervall_als_text(importierte_einstellungen['session_refresh_interval'], 'minuten')}\n"
+            f"Watchdog: {intervall_als_text(importierte_einstellungen['watchdog_timeout'], 'sekunden')}\n\n"
+            "Nur diese vier Werte werden übernommen. Zugangsdaten, Tokens und SMS-Daten "
+            "bleiben auf diesem Gerät unverändert."
+        )
+        if not messagebox.askyesno(
+            "Einstellungen übernehmen?",
+            zusammenfassung,
+            parent=self.root,
+        ):
+            return
+
+        neue_einstellungen = dict(APP_SETTINGS)
+        neue_einstellungen.update(importierte_einstellungen)
+        if not speichere_app_einstellungen(neue_einstellungen):
+            messagebox.showerror(
+                "Import fehlgeschlagen",
+                "Die Einstellungen konnten nicht gespeichert werden. "
+                "Die bisherige Konfiguration bleibt aktiv.",
+                parent=self.root,
+            )
+            return
 
         global BASE_URL
         global POLL_INTERVAL
@@ -5518,17 +5782,35 @@ class CudyGUI:
         global letzter_session_refresh
         global letzter_erfolgreicher_poll
 
-        def sekunden_aus_text(wert):
-            if wert == "Aus":
-                return 0
+        BASE_URL = importierte_einstellungen["router_url"]
+        POLL_INTERVAL = importierte_einstellungen["poll_interval"]
+        SESSION_REFRESH_INTERVAL = importierte_einstellungen[
+            "session_refresh_interval"
+        ]
+        WATCHDOG_TIMEOUT = importierte_einstellungen["watchdog_timeout"]
 
-            zahl = int(wert.split()[0])
+        self.router_entry.delete(0, tk.END)
+        self.router_entry.insert(0, BASE_URL)
+        self.poll_interval_var.set(intervall_als_text(POLL_INTERVAL, "sekunden"))
+        self.session_refresh_var.set(
+            intervall_als_text(SESSION_REFRESH_INTERVAL, "minuten")
+        )
+        self.watchdog_var.set(intervall_als_text(WATCHDOG_TIMEOUT, "sekunden"))
 
-            # Poll/Watchdog sind in Sekunden, Session-Refresh in Minuten.
-            if "Minute" in wert:
-                return zahl * 60
+        jetzt = time.monotonic()
+        letzter_session_refresh = jetzt
+        letzter_erfolgreicher_poll = jetzt
+        print("Einstellungen aus Datei importiert und gespeichert.")
+        gui_status("status", "Einstellungen importiert")
 
-            return zahl
+    def einstellungen_speichern(self):
+
+        global BASE_URL
+        global POLL_INTERVAL
+        global SESSION_REFRESH_INTERVAL
+        global WATCHDOG_TIMEOUT
+        global letzter_session_refresh
+        global letzter_erfolgreicher_poll
 
         neuer_poll = sekunden_aus_text(
             self.poll_interval_var.get()

@@ -21,6 +21,7 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - One-time speed-test prompt on the first packaged EXE launch, with a repeatable test in the Signal tab
 - Router admin password can be changed from Settings; the app verifies a fresh login before saving the new password with Windows DPAPI
 - First-run prompt recommends replacing the factory router password and verifies the password entered for the app
+- Settings can be exported and restored as a versioned JSON file; only the router address and monitoring intervals are included
 
 ## Requirements
 
@@ -75,6 +76,6 @@ The Log tab's Auto-Follow control starts enabled and keeps new messages in view.
 - Polling for refill triggers reads the first inbox page.
 - The band comparison uses Cloudflare's public download endpoint. It transfers up to about 80 MB across ten bands and does not measure upload speed.
 - The reported latency and jitter are HTTP probe timings; failed probes are shown as request failures, not a dedicated radio packet-loss measurement.
-- Poll interval, session refresh, watchdog, and router URL are stored in the per-user settings file.
+- Poll interval, session refresh, watchdog, and router URL are stored in the per-user settings file. The Settings tab can export and restore these four values; imports are validated and shown for confirmation before they are applied. Passwords, tokens, SMS content, SMS history, and the first-run prompt state are excluded.
 
 The LTE band controls use the LT300 V3 router's Cellular/APN form. The comparison reports the fastest download band and the band with the lowest measured latency and request-failure rate for latency-sensitive use. The manual emergency-send path in the working copy has now been live-tested: the router accepted the SMS and the outgoing `Refill` appeared in the outbox. The automated refill flow has not yet been independently live-tested in this working copy.
