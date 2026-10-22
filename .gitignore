@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.build-venv/
+/build/
+/dist/
 .env
 .env.*
 cudy_credentials.json

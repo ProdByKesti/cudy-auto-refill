@@ -38,6 +38,42 @@ Install the Python packages with:
 python -m pip install -r requirements.txt
 ```
 
+## Windows EXE for family and friends
+
+The Windows release is a standalone EXE; people using it do not need to install Python. Build it on Windows from a checkout of this repository. The build machine needs Python 3 and an internet connection for the isolated build environment and its packages.
+
+From PowerShell in the project folder, run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\build_windows.ps1
+```
+
+The first build creates `.build-venv`, installs the pinned build requirements, and writes two files to `dist`:
+
+- `CudyAutoRefill.exe` is the normal app for family and friends.
+- `CudyAutoRefill_FirstStart.exe` is a repeatable setup and recovery simulator for development. It uses the current application code, an isolated test profile, and simulated router actions; it does not send SMS, change LTE bands, or clean router messages.
+
+Build output and the virtual environment are ignored by Git. Publish only the normal app as an asset on a GitHub Release; do not commit either EXE into the source repository.
+
+On first launch, the app guides the user through the router address and SMS polling interval, checks that the router web page can be reached, and then offers the router-password security setup. It recommends the all-band LTE comparison once; this can also be run later from the Signal tab. The PC must be connected to the Cudy router over Wi-Fi or LAN during setup. Monitoring only begins after the user presses Start.
+
+### Updating and recovery
+
+To update, close the app, download the newer EXE from the GitHub Release, and replace the old EXE. Keep it under the same Windows user account so the saved password can still be decrypted. Router settings, the DPAPI-protected password, SMS state, LTE profile, and logs stay in `%LOCALAPPDATA%\CudyAutoRefill`, separate from the EXE and the public project folder. Replacing the EXE does not remove those files.
+
+If an update causes a problem, close the app and replace the EXE with the previous GitHub Release. For support, copy the redacted report from the Log tab before changing or deleting local data. To completely reset the app for the current Windows user, first close it, then rename `%LOCALAPPDATA%\CudyAutoRefill` to keep a backup; the next launch starts a fresh setup. The saved router password is protected for the Windows user and should not be copied into a public repository or shared with another person.
+
+### First-launch checklist
+
+Use a fresh Windows user profile or a clean Windows test machine to check a release:
+
+1. Confirm that the EXE starts without Python installed.
+2. Confirm that router address and polling interval can be saved and that the router connection check reports the correct result.
+3. Confirm that the password setup and optional LTE band comparison behave as expected.
+4. Close and reopen the EXE; the initial setup prompts should not repeat, and the saved settings should remain available.
+5. Confirm that no password, SMS history, settings, or log files appear beside the EXE.
+
 ## Router credentials
 
 For a local Python setup, create `cudy_credentials.json` from the example (for example with `Copy-Item cudy_credentials.example.json cudy_credentials.json`) and enter the router password locally.
@@ -57,6 +93,8 @@ To repeat the onboarding flow on every launch, run the separate first-start test
 ```powershell
 python cudy_auto_refill_first_start.py
 ```
+
+The build script also creates `dist\CudyAutoRefill_FirstStart.exe`, which runs the same first-start test launcher without requiring Python on the test computer.
 
 It uses an isolated test profile and ignores saved passwords and SMS history. On each launch, choose one of four repeatable scenarios: successful connection, one failed login followed by success, an unavailable router with three retries, or a rejected router password. The normal router-password onboarding and LTE prompt then run again.
 

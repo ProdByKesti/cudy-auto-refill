@@ -41,7 +41,7 @@ APP_HOME_DIR = (
     if getattr(sys, "frozen", False)
     else os.path.dirname(os.path.abspath(__file__))
 )
-LOCAL_DATA_ROOT = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+LOCAL_DATA_ROOT = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
 NORMAL_APP_DATA_DIR = os.path.join(LOCAL_DATA_ROOT, "CudyAutoRefill")
 APP_DATA_DIR = os.path.join(
     LOCAL_DATA_ROOT,
@@ -56,6 +56,11 @@ LEGACY_CREDENTIAL_FILES = (
 )
 SMS_STATE_FILE = os.path.join(APP_DATA_DIR, "sms_state.json")
 LEGACY_SMS_STATE_FILE = os.path.join(APP_HOME_DIR, "sms_state.json")
+if getattr(sys, "frozen", False):
+    # Packaged builds must never depend on or migrate mutable files beside the
+    # executable. Passwords and runtime data live only in the user's profile.
+    LEGACY_CREDENTIAL_FILES = (os.path.join(APP_DATA_DIR, "cudy_credentials.json"),)
+    LEGACY_SMS_STATE_FILE = None
 if FIRST_START_TEST_MODE:
     # The test launcher must never import live credentials or SMS history.
     LEGACY_CREDENTIAL_FILES = ()
@@ -699,8 +704,9 @@ class QueueLogger:
         if not value:
             return
         with self._lock:
-            self.original_stdout.write(value)
-            self.original_stdout.flush()
+            if self.original_stdout is not None:
+                self.original_stdout.write(value)
+                self.original_stdout.flush()
             log_queue.put(("log", value))
             self._buffer += value
             while "\n" in self._buffer:
@@ -710,7 +716,8 @@ class QueueLogger:
 
     def flush(self):
         with self._lock:
-            self.original_stdout.flush()
+            if self.original_stdout is not None:
+                self.original_stdout.flush()
             if self._buffer:
                 if self.file_logger:
                     self.file_logger.info(redact_log_line(self._buffer))
@@ -1724,6 +1731,7 @@ def lade_sms_state():
 
     if (
         not os.path.exists(SMS_STATE_FILE)
+        and LEGACY_SMS_STATE_FILE
         and os.path.exists(LEGACY_SMS_STATE_FILE)
     ):
         try:
@@ -6042,11 +6050,209 @@ class CudyGUI:
         dialog.grab_set()
         (entries.get("old") or entries.get("current")).focus_set()
 
+    def erste_router_einrichtung(self):
+        """Guide a new user through the router address and polling defaults."""
+        global BASE_URL
+        global POLL_INTERVAL
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Cudy Auto Refill – Ersteinrichtung")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(
+            frame,
+            text="Mit dem Cudy-Router verbinden",
+            font=("Segoe UI", 14, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            frame,
+            text=(
+                "Verbinde diesen PC per WLAN oder LAN mit deinem Cudy-Router. "
+                "Die App verwendet standardmäßig http://192.168.10.1. "
+                "Im nächsten Schritt wird dein Admin-Passwort geprüft oder geändert."
+            ),
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 16))
+
+        ttk.Label(frame, text="Router-Adresse:").grid(
+            row=2, column=0, sticky="w", pady=4
+        )
+        router_url_var = tk.StringVar(value=BASE_URL)
+        router_entry = ttk.Entry(frame, textvariable=router_url_var, width=42)
+        router_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+
+        ttk.Label(frame, text="SMS-Prüfintervall:").grid(
+            row=3, column=0, sticky="w", pady=4
+        )
+        poll_seconds = (5, 10, 15, 30, 60, 120, 300)
+        poll_values = [
+            intervall_als_text(value, "sekunden")
+            for value in poll_seconds
+        ]
+        initial_poll_interval = (
+            POLL_INTERVAL if POLL_INTERVAL in poll_seconds else 10
+        )
+        poll_var = tk.StringVar(
+            value=intervall_als_text(initial_poll_interval, "sekunden")
+        )
+        poll_combo = ttk.Combobox(
+            frame,
+            textvariable=poll_var,
+            values=poll_values,
+            state="readonly",
+            width=18,
+        )
+        poll_combo.grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(
+            frame,
+            text="10 Sekunden empfohlen",
+        ).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=4)
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(
+            frame,
+            textvariable=status_var,
+            wraplength=520,
+            justify="left",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 4))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        test_button = ttk.Button(buttons, text="Router-Verbindung testen")
+        test_button.pack(side="left", padx=(0, 8))
+        continue_button = ttk.Button(buttons, text="Speichern und weiter")
+        continue_button.pack(side="left")
+
+        busy = False
+
+        def router_verbindung_testen():
+            nonlocal busy
+            if busy:
+                return
+            try:
+                router_url = validiere_router_basis_url(router_url_var.get())
+            except ValueError as exc:
+                status_var.set(str(exc))
+                return
+
+            if FIRST_START_TEST_MODE:
+                status_var.set(
+                    "Erststart-Test: Verbindungstest simuliert; kein Router wurde kontaktiert."
+                )
+                return
+
+            busy = True
+            test_button.config(state="disabled")
+            continue_button.config(state="disabled")
+            status_var.set("Prüfe die Verbindung zum Router …")
+
+            def worker():
+                try:
+                    response = requests.get(
+                        f"{router_url}/cgi-bin/luci/",
+                        timeout=ROUTER_AUTH_TIMEOUT,
+                    )
+                    result = (
+                        True,
+                        f"Der Router antwortet (HTTP {response.status_code}). "
+                        "Die Netzwerkverbindung steht; die Anmeldung wird "
+                        "im nächsten Schritt geprüft.",
+                    )
+                except Exception:
+                    result = (
+                        False,
+                        "Router nicht erreichbar. Prüfe die WLAN-/LAN-Verbindung "
+                        "und die Router-Adresse; du kannst sie unten anpassen.",
+                    )
+
+                def finish():
+                    nonlocal busy
+                    busy = False
+                    if not dialog.winfo_exists():
+                        return
+                    status_var.set(result[1])
+                    test_button.config(state="normal")
+                    continue_button.config(state="normal")
+
+                try:
+                    self.root.after(0, finish)
+                except tk.TclError:
+                    pass
+
+            starte_hintergrund_thread(worker, name="cudy-first-run-connection-check")
+
+        test_button.config(command=router_verbindung_testen)
+
+        def speichern_und_weiter():
+            global BASE_URL
+            global POLL_INTERVAL
+
+            try:
+                werte = validiere_einstellungen_werte({
+                    "router_url": router_url_var.get(),
+                    "poll_interval": sekunden_aus_text(poll_var.get()),
+                    "session_refresh_interval": SESSION_REFRESH_INTERVAL,
+                    "watchdog_timeout": WATCHDOG_TIMEOUT,
+                })
+            except ValueError as exc:
+                messagebox.showerror(
+                    "Einstellungen ungültig",
+                    str(exc),
+                    parent=dialog,
+                )
+                return
+
+            neue_einstellungen = {
+                **APP_SETTINGS,
+                **werte,
+                "router_connection_setup_done": True,
+            }
+            if not speichere_app_einstellungen(neue_einstellungen):
+                messagebox.showerror(
+                    "Einrichtung nicht gespeichert",
+                    "Die Grundeinstellungen konnten nicht im Windows-Benutzerprofil "
+                    "gespeichert werden. Prüfe die Berechtigungen und versuche es erneut.",
+                    parent=dialog,
+                )
+                return
+
+            BASE_URL = werte["router_url"]
+            POLL_INTERVAL = werte["poll_interval"]
+            self.router_entry.delete(0, "end")
+            self.router_entry.insert(0, BASE_URL)
+            self.poll_interval_var.set(
+                intervall_als_text(POLL_INTERVAL, "sekunden")
+            )
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+            self.erste_app_einrichtung()
+
+        continue_button.config(command=speichern_und_weiter)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.columnconfigure(1, weight=1)
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.grab_set()
+        router_entry.focus_set()
+
     def erste_app_einrichtung(self):
         global PASSWORT
 
         if APP_SETTINGS.get("router_password_security_prompt_done"):
             self.erster_start_speedtest()
+            return
+
+        if not APP_SETTINGS.get("router_connection_setup_done"):
+            self.erste_router_einrichtung()
             return
 
         if not PASSWORT:
@@ -7629,9 +7835,10 @@ if __name__ == "__main__":
 
     original_stdout = sys.stdout
 
-    sys.stdout = QueueLogger(
-        original_stdout
-    )
+    output_logger = QueueLogger(original_stdout)
+    sys.stdout = output_logger
+    if sys.stderr is None:
+        sys.stderr = output_logger
 
     root = tk.Tk()
 
