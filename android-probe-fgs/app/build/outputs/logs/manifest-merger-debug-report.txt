@@ -1,0 +1,79 @@
+-- Merging decision tree log ---
+manifest
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:2:1-30:12
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:2:1-30:12
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:2:1-30:12
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:2:1-30:12
+	package
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	android:versionName
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	android:versionCode
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	xmlns:android
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:2:11-69
+uses-permission#android.permission.INTERNET
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:4:5-67
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:4:22-64
+uses-permission#android.permission.FOREGROUND_SERVICE
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:5:5-77
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:5:22-74
+uses-permission#android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:6:5-94
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:6:22-91
+uses-permission#android.permission.POST_NOTIFICATIONS
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:7:5-77
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:7:22-74
+uses-permission#android.permission.CHANGE_NETWORK_STATE
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:8:5-79
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:8:22-76
+application
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:10:5-29:19
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:10:5-29:19
+	android:extractNativeLibs
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	android:label
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:12:9-46
+	android:allowBackup
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:11:9-36
+	android:theme
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:13:9-72
+	android:usesCleartextTraffic
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:14:9-44
+activity#de.prodbykesti.cudyrouterprobe.MainActivity
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:16:9-23:20
+	android:exported
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:18:13-36
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:17:13-41
+intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:19:13-22:29
+action#android.intent.action.MAIN
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:20:17-69
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:20:25-66
+category#android.intent.category.LAUNCHER
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:21:17-77
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:21:27-74
+service#de.prodbykesti.cudyrouterprobe.RouterProbeService
+ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:25:9-28:63
+	android:exported
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:27:13-37
+	android:foregroundServiceType
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:28:13-60
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:26:13-47
+uses-sdk
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml

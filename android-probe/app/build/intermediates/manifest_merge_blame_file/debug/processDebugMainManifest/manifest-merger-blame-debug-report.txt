@@ -1,0 +1,49 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="de.prodbykesti.cudyrouterprobe"
+4    android:versionCode="1"
+5    android:versionName="0.1" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="23"
+9        android:targetSdkVersion="35" />
+10
+11    <uses-permission android:name="android.permission.INTERNET" />
+11-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:3:5-67
+11-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:3:22-64
+12
+13    <application
+13-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:5:5-19:19
+14        android:allowBackup="false"
+14-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:6:9-36
+15        android:debuggable="true"
+16        android:extractNativeLibs="false"
+17        android:label="Cudy Router Probe"
+17-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:7:9-42
+18        android:supportsRtl="true"
+18-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:8:9-35
+19        android:testOnly="true"
+20        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+20-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:9:9-72
+21        android:usesCleartextTraffic="true" >
+21-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:10:9-44
+22        <activity
+22-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:11:9-18:20
+23            android:name="de.prodbykesti.cudyrouterprobe.MainActivity"
+23-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:12:13-41
+24            android:exported="true" >
+24-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:13:13-36
+25            <intent-filter>
+25-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:14:13-17:29
+26                <action android:name="android.intent.action.MAIN" />
+26-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:15:17-69
+26-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:15:25-66
+27
+28                <category android:name="android.intent.category.LAUNCHER" />
+28-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:16:17-77
+28-->C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:16:27-74
+29            </intent-filter>
+30        </activity>
+31    </application>
+32
+33</manifest>

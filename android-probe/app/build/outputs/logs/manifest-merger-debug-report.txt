@@ -1,0 +1,57 @@
+-- Merging decision tree log ---
+manifest
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:2:1-20:12
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:2:1-20:12
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:2:1-20:12
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:2:1-20:12
+	package
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	android:versionName
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	android:versionCode
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	xmlns:android
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:2:11-69
+uses-permission#android.permission.INTERNET
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:3:5-67
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:3:22-64
+application
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:5:5-19:19
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:5:5-19:19
+	android:extractNativeLibs
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	android:supportsRtl
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:8:9-35
+	android:label
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:7:9-42
+	android:allowBackup
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:6:9-36
+	android:theme
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:9:9-72
+	android:usesCleartextTraffic
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:10:9-44
+activity#de.prodbykesti.cudyrouterprobe.MainActivity
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:11:9-18:20
+	android:exported
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:13:13-36
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:12:13-41
+intent-filter#action:name:android.intent.action.MAIN+category:name:android.intent.category.LAUNCHER
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:14:13-17:29
+action#android.intent.action.MAIN
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:15:17-69
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:15:25-66
+category#android.intent.category.LAUNCHER
+ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:16:17-77
+	android:name
+		ADDED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml:16:27-74
+uses-sdk
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from C:\Codes\CudyRefill\android-probe\app\src\main\AndroidManifest.xml

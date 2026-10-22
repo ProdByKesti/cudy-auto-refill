@@ -1,0 +1,8 @@
+de.prodbykesti.cudyrouterprobe.app-pngs-0 C:\Codes\CudyRefill\android-probe-fgs\app\build\generated\res\pngs\debug
+de.prodbykesti.cudyrouterprobe.app-resValues-1 C:\Codes\CudyRefill\android-probe-fgs\app\build\generated\res\resValues\debug
+de.prodbykesti.cudyrouterprobe.app-updated_navigation_xml-2 C:\Codes\CudyRefill\android-probe-fgs\app\build\generated\updated_navigation_xml\debug
+de.prodbykesti.cudyrouterprobe.app-packageDebugResources-3 C:\Codes\CudyRefill\android-probe-fgs\app\build\intermediates\incremental\debug\packageDebugResources\merged.dir
+de.prodbykesti.cudyrouterprobe.app-packageDebugResources-4 C:\Codes\CudyRefill\android-probe-fgs\app\build\intermediates\incremental\debug\packageDebugResources\stripped.dir
+de.prodbykesti.cudyrouterprobe.app-debug-5 C:\Codes\CudyRefill\android-probe-fgs\app\build\intermediates\merged_res\debug\mergeDebugResources
+de.prodbykesti.cudyrouterprobe.app-debug-6 C:\Codes\CudyRefill\android-probe-fgs\app\src\debug\res
+de.prodbykesti.cudyrouterprobe.app-main-7 C:\Codes\CudyRefill\android-probe-fgs\app\src\main\res

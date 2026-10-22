@@ -1,0 +1,68 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="de.prodbykesti.cudyrouterprobe.fgs"
+4    android:versionCode="1"
+5    android:versionName="1.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="23"
+9        android:targetSdkVersion="35" />
+10
+11    <uses-permission android:name="android.permission.INTERNET" />
+11-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:4:5-67
+11-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:4:22-64
+12    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+12-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:5:5-77
+12-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:5:22-74
+13    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+13-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:6:5-94
+13-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:6:22-91
+14    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+14-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:7:5-77
+14-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:7:22-74
+15    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+15-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:8:5-79
+15-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:8:22-76
+16
+17    <application
+17-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:10:5-29:19
+18        android:allowBackup="false"
+18-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:11:9-36
+19        android:debuggable="true"
+20        android:extractNativeLibs="false"
+21        android:label="Cudy Background Probe"
+21-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:12:9-46
+22        android:testOnly="true"
+23        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+23-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:13:9-72
+24        android:usesCleartextTraffic="true" >
+24-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:14:9-44
+25        <activity
+25-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:16:9-23:20
+26            android:name="de.prodbykesti.cudyrouterprobe.MainActivity"
+26-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:17:13-41
+27            android:exported="true" >
+27-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:18:13-36
+28            <intent-filter>
+28-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:19:13-22:29
+29                <action android:name="android.intent.action.MAIN" />
+29-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:20:17-69
+29-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:20:25-66
+30
+31                <category android:name="android.intent.category.LAUNCHER" />
+31-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:21:17-77
+31-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:21:27-74
+32            </intent-filter>
+33        </activity>
+34
+35        <service
+35-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:25:9-28:63
+36            android:name="de.prodbykesti.cudyrouterprobe.RouterProbeService"
+36-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:26:13-47
+37            android:exported="false"
+37-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:27:13-37
+38            android:foregroundServiceType="connectedDevice" />
+38-->C:\Codes\CudyRefill\android-probe-fgs\app\src\main\AndroidManifest.xml:28:13-60
+39    </application>
+40
+41</manifest>

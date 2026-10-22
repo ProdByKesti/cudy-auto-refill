@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="base_library3">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/build/pyinstaller/CudyAutoRefill/CudyAutoRefill/base_library.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
