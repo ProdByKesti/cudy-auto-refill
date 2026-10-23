@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 from lte_features import (
     LTE_BANDS,
     apply_band_config_with_fallback,
+    recover_offline_manual_band,
     read_band_config,
     run_all_band_speedtest,
 )
@@ -3827,6 +3828,28 @@ def hauptschleife():
             login_retry_delay * 2,
             LOGIN_RETRY_MAX_SECONDS,
         )
+
+    if not FIRST_START_TEST_MODE:
+        try:
+            band_recovery = recover_offline_manual_band(
+                session,
+                BASE_URL,
+                router_session_sicherstellen,
+                progress=print,
+            )
+            if band_recovery["status"] == "automatic_fallback":
+                print(
+                    "LTE-Startwiederherstellung: automatische Bandwahl wurde gespeichert. "
+                    "Die SMS-Überwachung läuft weiter, während der Router die Verbindung aufbaut."
+                )
+            elif band_recovery["status"] == "manual_band_online":
+                print("LTE-Startprüfung: manuelle Bandwahl hat Internetzugang.")
+        except Exception as exc:
+            print(
+                "LTE-Startwiederherstellung fehlgeschlagen; "
+                "die SMS-Überwachung wird trotzdem fortgesetzt:",
+                exc,
+            )
 
     letzter_session_refresh = (
         time.monotonic()

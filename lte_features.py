@@ -144,11 +144,15 @@ def _cancelled(event):
 
 def _internet_ready(net, event, progress, timeout=RECONNECT_SECONDS):
     end = time.monotonic() + timeout
+    request_timeout = (
+        min(5, max(1, timeout / 3)),
+        min(6, max(1, timeout / 3)),
+    )
     while time.monotonic() < end and not _cancelled(event):
         try:
             response = net.get(
                 DOWNLOAD_URL, params={"bytes": 0, "check": time.monotonic_ns()},
-                timeout=(5, 6),
+                timeout=request_timeout,
             )
             response.raise_for_status()
             response.close()
@@ -168,6 +172,26 @@ def wait_for_internet(progress=None, timeout=60):
         return _internet_ready(net, None, progress, timeout)
     finally:
         net.close()
+
+
+def recover_offline_manual_band(
+    session, base_url, ensure_session, progress=None, probe_timeout=6
+):
+    """Fall back to automatic LTE band selection only when a locked band is offline."""
+    current = read_band_config(session, base_url, ensure_session)
+    if current["automatic"]:
+        return {"status": "already_automatic", "previous": current}
+
+    if wait_for_internet(progress=None, timeout=probe_timeout):
+        return {"status": "manual_band_online", "previous": current}
+
+    if progress:
+        progress(
+            "Mit der gespeicherten manuellen Bandwahl ist das Internet nicht erreichbar; "
+            "automatische LTE-Bandwahl wird aktiviert …"
+        )
+    apply_band_config(session, base_url, ensure_session, True, [])
+    return {"status": "automatic_fallback", "previous": current}
 
 
 def apply_band_config_with_fallback(
