@@ -24,6 +24,7 @@ from lte_features import (
     recover_offline_manual_band,
     read_band_config,
     run_all_band_speedtest,
+    measure_current_download_speed,
 )
 
 # ============================================================
@@ -429,11 +430,12 @@ DOWNLOAD_PROACTIVE_STARTED_AT = None
 DOWNLOAD_PROACTIVE_NEXT_AT = None
 DOWNLOAD_PROACTIVE_ATTEMPTS = 0
 DOWNLOAD_PROACTIVE_IN_PROGRESS = False
+DOWNLOAD_PROACTIVE_ACTION_STARTED_AT = None
 DOWNLOAD_PROACTIVE_BLOCKED = False
 DOWNLOAD_PROACTIVE_LAST_RESULT = "Noch kein Download-Modus gestartet."
 DOWNLOAD_PROACTIVE_LAST_ACTION_ID = None
 DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = None
-DOWNLOAD_LAST_REFILL_CONFIRMED_AT = None
+DOWNLOAD_LAST_REFILL_ACTION_AT = None
 DOWNLOAD_MODE_LOCK = threading.RLock()
 
 
@@ -461,6 +463,18 @@ def parse_download_size_gb(value):
     if not size.is_finite() or size <= 0:
         raise ValueError("Bitte eine Downloadgröße größer als 0 eingeben.")
     return size
+
+
+def parse_download_interval_seconds(value):
+    """Parse a 1–720 minute proactive interval, allowing decimal commas."""
+    normalized = str(value).strip().replace(",", ".")
+    try:
+        minutes = Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError("Bitte ein Intervall zwischen 1 und 720 Minuten eingeben.") from exc
+    if not minutes.is_finite() or minutes < 1 or minutes > 720:
+        raise ValueError("Das Intervall muss zwischen 1 und 720 Minuten liegen.")
+    return int((minutes * 60).to_integral_value(rounding=ROUND_CEILING))
 
 
 def recommended_refill_count(download_size_gb):
@@ -508,13 +522,13 @@ def notiere_download_refill_bestaetigung(aktions_id, bestaetigt, abgelaufen=Fals
     global DOWNLOAD_PROACTIVE_BLOCKED
     global DOWNLOAD_PROACTIVE_NEXT_AT
     global DOWNLOAD_PROACTIVE_LAST_RESULT
-    global DOWNLOAD_LAST_REFILL_CONFIRMED_AT
+    global DOWNLOAD_LAST_REFILL_ACTION_AT
 
     with DOWNLOAD_MODE_LOCK:
         if not DOWNLOAD_MODE_ACTIVE:
             return
         if bestaetigt:
-            DOWNLOAD_LAST_REFILL_CONFIRMED_AT = time.monotonic()
+            DOWNLOAD_LAST_REFILL_ACTION_AT = time.monotonic()
         if not DOWNLOAD_PROACTIVE_ENABLED:
             return
         if (
@@ -825,6 +839,7 @@ FEHLER_PHASEN = {
     "login": "Router-Login",
     "poll": "Inbox-Polling",
     "outbox": "Refill-Bestätigung",
+    "download_send": "Proaktiver Refill-Versand",
 }
 AKTIVE_FEHLER = {}
 AKTIVE_FEHLER_TYPEN = {}
@@ -2374,10 +2389,10 @@ def refill_versuch(cfg, aktions_id, sms_state_id=None):
         with DOWNLOAD_MODE_LOCK:
             cooldown_rest = (
                 DOWNLOAD_PROACTIVE_INTERVAL_SECONDS
-                - (time.monotonic() - DOWNLOAD_LAST_REFILL_CONFIRMED_AT)
+                - (time.monotonic() - DOWNLOAD_LAST_REFILL_ACTION_AT)
                 if (
                     DOWNLOAD_MODE_ACTIVE
-                    and DOWNLOAD_LAST_REFILL_CONFIRMED_AT is not None
+                    and DOWNLOAD_LAST_REFILL_ACTION_AT is not None
                 )
                 else 0
             )
@@ -2388,7 +2403,7 @@ def refill_versuch(cfg, aktions_id, sms_state_id=None):
                 f"Download-Mindestabstand läuft noch {int(cooldown_rest)} Sekunden.",
             )
             raise OutboxSnapshotError(
-                "Der Mindestabstand nach der letzten bestätigten Refill-SMS läuft noch."
+                "Der Mindestabstand nach der letzten Refill-SMS läuft noch."
             )
 
         notiere_download_refill_versuch(aktions_id)
@@ -3454,6 +3469,7 @@ def pruefe_download_refill_plan():
     global DOWNLOAD_PROACTIVE_LAST_RESULT
     global DOWNLOAD_PROACTIVE_NEXT_AT
     global DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID
+    global DOWNLOAD_PROACTIVE_ACTION_STARTED_AT
     global DOWNLOAD_PROACTIVE_BLOCKED
 
     aktualisiere_download_laufzeitlimit()
@@ -3524,21 +3540,29 @@ def pruefe_download_refill_plan():
         DOWNLOAD_PROACTIVE_ATTEMPTS += 1
         aktions_id = f"DL-{uuid.uuid4().hex[:8].upper()}"
         DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = aktions_id
+        DOWNLOAD_PROACTIVE_ACTION_STARTED_AT = time.monotonic()
         DOWNLOAD_PROACTIVE_LAST_ACTION_ID = aktions_id
         DOWNLOAD_PROACTIVE_NEXT_AT = None
         DOWNLOAD_PROACTIVE_LAST_RESULT = (
             f"Refill-Zyklus {DOWNLOAD_PROACTIVE_ATTEMPTS}/"
-            f"{DOWNLOAD_PROACTIVE_MAX_REFILLS} läuft; Outbox-Bestätigung steht aus."
+            f"{DOWNLOAD_PROACTIVE_MAX_REFILLS} wird gesendet."
         )
 
     def worker():
+        global DOWNLOAD_LAST_REFILL_ACTION_AT
+        global DOWNLOAD_PROACTIVE_ACTION_STARTED_AT
+        global DOWNLOAD_PROACTIVE_BLOCKED
+        global DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID
+        global DOWNLOAD_PROACTIVE_ENABLED
+        global DOWNLOAD_PROACTIVE_IN_PROGRESS
+        global DOWNLOAD_PROACTIVE_LAST_RESULT
+        global DOWNLOAD_PROACTIVE_NEXT_AT
+
         angenommen = False
-        bestaetigt = False
         fehler = None
         try:
             if FIRST_START_TEST_MODE:
-                bestaetigt = refill_versuch("SIMULIERT", aktions_id)
-                angenommen = bestaetigt
+                angenommen = refill_versuch("SIMULIERT", aktions_id)
             else:
                 log_refill_aktion(
                     aktions_id,
@@ -3548,7 +3572,6 @@ def pruefe_download_refill_plan():
                 if not router_session_sicherstellen():
                     raise RuntimeError("Router-Sitzung konnte nicht hergestellt werden.")
 
-                baseline = outbox_snapshot()
                 log_refill_aktion(
                     aktions_id,
                     "VERSAND",
@@ -3558,72 +3581,81 @@ def pruefe_download_refill_plan():
                     raise RuntimeError("Der Router hat die SMS nicht angenommen.")
 
                 angenommen = True
+                with DOWNLOAD_MODE_LOCK:
+                    DOWNLOAD_LAST_REFILL_ACTION_AT = time.monotonic()
                 log_refill_aktion(
                     aktions_id,
                     "VERSAND ANGENOMMEN",
-                    "Der Router hat die proaktive SMS angenommen; prüfe die Outbox.",
+                    "Der Router hat die proaktive SMS angenommen; die Outbox wird "
+                    "für diesen Zyklus nicht geprüft.",
                 )
-                bestaetigt = warte_auf_outbox_bestaetigung(baseline, aktions_id)
-                if not bestaetigt:
-                    fehler = "Noch keine neue Refill-SMS in der Outbox bestätigt."
+                bereinige_fehler("download_send", nur_art="download-send")
         except Exception as exc:
             fehler = str(exc)
             log_refill_aktion(
                 aktions_id,
                 "PROAKTIVER REFILL FEHLGESCHLAGEN",
-                "Versand oder Bestätigung fehlgeschlagen: " + fehler,
+                "Der proaktive Versand konnte nicht abgeschlossen werden: " + fehler,
             )
             print("Download-Modus: proaktiver Refill fehlgeschlagen:", fehler)
         finally:
-            REFILL_SEND_LOCK.release()
-            with DOWNLOAD_MODE_LOCK:
-                DOWNLOAD_PROACTIVE_IN_PROGRESS = False
-                DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = None
-                if bestaetigt:
-                    DOWNLOAD_PROACTIVE_BLOCKED = False
-                    DOWNLOAD_PROACTIVE_LAST_RESULT = (
-                        "Refill-SMS in der Outbox bestätigt."
-                    )
-                    if (
-                        DOWNLOAD_MODE_ACTIVE
-                        and DOWNLOAD_PROACTIVE_ENABLED
-                        and DOWNLOAD_PROACTIVE_ATTEMPTS
-                        >= DOWNLOAD_PROACTIVE_MAX_REFILLS
-                    ):
-                        DOWNLOAD_PROACTIVE_ENABLED = False
+            try:
+                REFILL_SEND_LOCK.release()
+            except RuntimeError as exc:
+                print("Download-Modus: Refill-Sperre konnte nicht freigegeben werden:", exc)
+            finally:
+                with DOWNLOAD_MODE_LOCK:
+                    DOWNLOAD_PROACTIVE_IN_PROGRESS = False
+                    DOWNLOAD_PROACTIVE_ACTION_STARTED_AT = None
+                    DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = None
+                    if angenommen:
+                        DOWNLOAD_PROACTIVE_BLOCKED = False
+                        DOWNLOAD_PROACTIVE_LAST_RESULT = (
+                            "Router hat die proaktive SMS angenommen. "
+                            "Outbox-Bestätigung wird für diesen Zyklus übersprungen; "
+                            "die tatsächliche Datenfreischaltung ist nicht prüfbar."
+                        )
+                        if (
+                            DOWNLOAD_MODE_ACTIVE
+                            and DOWNLOAD_PROACTIVE_ENABLED
+                            and DOWNLOAD_PROACTIVE_ATTEMPTS
+                            >= DOWNLOAD_PROACTIVE_MAX_REFILLS
+                        ):
+                            DOWNLOAD_PROACTIVE_ENABLED = False
+                            DOWNLOAD_PROACTIVE_NEXT_AT = None
+                            DOWNLOAD_PROACTIVE_LAST_RESULT += (
+                                " Maximale Zahl proaktiver Refills erreicht; Zyklen gestoppt."
+                            )
+                        elif DOWNLOAD_MODE_ACTIVE and DOWNLOAD_PROACTIVE_ENABLED:
+                            DOWNLOAD_PROACTIVE_NEXT_AT = (
+                                time.monotonic()
+                                + DOWNLOAD_PROACTIVE_INTERVAL_SECONDS
+                            )
+                    else:
+                        DOWNLOAD_PROACTIVE_BLOCKED = True
                         DOWNLOAD_PROACTIVE_NEXT_AT = None
-                        DOWNLOAD_PROACTIVE_LAST_RESULT += (
-                            " Maximale Zahl proaktiver Refills erreicht; Zyklen gestoppt."
+                        DOWNLOAD_PROACTIVE_LAST_RESULT = (
+                            fehler
+                            or (
+                                "Der Router hat die proaktive SMS nicht angenommen; "
+                                "weitere Zyklen sind pausiert."
+                            )
                         )
-                    elif DOWNLOAD_MODE_ACTIVE and DOWNLOAD_PROACTIVE_ENABLED:
-                        DOWNLOAD_PROACTIVE_NEXT_AT = (
-                            time.monotonic()
-                            + DOWNLOAD_PROACTIVE_INTERVAL_SECONDS
-                        )
-                else:
-                    DOWNLOAD_PROACTIVE_BLOCKED = True
-                    DOWNLOAD_PROACTIVE_NEXT_AT = None
-                    DOWNLOAD_PROACTIVE_LAST_RESULT = (
-                        fehler
-                        or (
-                            "Refill nicht bestätigt; proaktive Zyklen pausiert."
-                        )
+                        if (
+                            DOWNLOAD_PROACTIVE_ATTEMPTS
+                            >= DOWNLOAD_PROACTIVE_MAX_REFILLS
+                        ):
+                            DOWNLOAD_PROACTIVE_ENABLED = False
+                            DOWNLOAD_PROACTIVE_LAST_RESULT += (
+                                " Maximale Zahl proaktiver Refills erreicht."
+                            )
+                if fehler and not angenommen:
+                    melde_fehler(
+                        "download_send",
+                        "Der proaktive Download-Refill konnte nicht an den Router übermittelt werden. "
+                        "Weitere Zyklen sind pausiert.",
+                        art="download-send",
                     )
-                    if (
-                        DOWNLOAD_PROACTIVE_ATTEMPTS
-                        >= DOWNLOAD_PROACTIVE_MAX_REFILLS
-                    ):
-                        DOWNLOAD_PROACTIVE_ENABLED = False
-                        DOWNLOAD_PROACTIVE_LAST_RESULT += (
-                            " Maximale Zahl proaktiver Refills erreicht."
-                        )
-            if fehler:
-                melde_fehler(
-                    "outbox",
-                    "Der proaktive Download-Refill wurde nicht sicher bestätigt. "
-                    "Weitere automatische SMS sind bis zur Prüfung pausiert.",
-                    art="confirmation",
-                )
 
     try:
         starte_hintergrund_thread(worker, name="cudy-download-refill")
@@ -3635,6 +3667,7 @@ def pruefe_download_refill_plan():
         REFILL_SEND_LOCK.release()
         with DOWNLOAD_MODE_LOCK:
             DOWNLOAD_PROACTIVE_IN_PROGRESS = False
+            DOWNLOAD_PROACTIVE_ACTION_STARTED_AT = None
             DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = None
             DOWNLOAD_PROACTIVE_ATTEMPTS = max(0, DOWNLOAD_PROACTIVE_ATTEMPTS - 1)
             DOWNLOAD_PROACTIVE_NEXT_AT = time.monotonic() + 10
@@ -4256,7 +4289,7 @@ class CudyGUI:
             value=f"{WATCHDOG_TIMEOUT} Sekunden"
         )
 
-        self.download_interval_var = tk.StringVar(value="60 Sekunden")
+        self.download_interval_var = tk.StringVar(value="1,0")
         self.download_duration_var = tk.StringVar(value="12 Stunden")
         self.download_max_refills_var = tk.StringVar(value="20")
         self.download_size_var = tk.StringVar(value="")
@@ -4264,6 +4297,8 @@ class CudyGUI:
             value="Optional: Downloadgröße eintragen, um einen Refill-Vorschlag zu erhalten."
         )
         self.download_time_estimate_var = tk.StringVar(value="")
+        self.download_speed_estimate_var = tk.StringVar(value="")
+        self._download_speedtest_running = False
         self.download_proactive_var = tk.BooleanVar(value=False)
         self.download_mode_status_var = tk.StringVar(
             value="Download-Modus ist ausgeschaltet."
@@ -5119,6 +5154,10 @@ class CudyGUI:
     def download_max_refills_eingabe_gueltig(value):
         return not value or (value.isascii() and value.isdigit())
 
+    @staticmethod
+    def download_interval_eingabe_gueltig(value):
+        return not value or bool(re.fullmatch(r"[0-9]{0,3}(?:[.,][0-9]?)?", value))
+
     def baue_download_tab(self):
         tab = self.download_inhalt
 
@@ -5184,19 +5223,29 @@ class CudyGUI:
         options = ttk.Frame(proactive_frame)
         options.pack(anchor="w", fill="x", pady=(10, 0))
 
-        ttk.Label(options, text="Mindestintervall:").grid(
+        ttk.Label(options, text="Mindestabstand (Minuten):").grid(
             row=0, column=0, sticky="w", padx=(0, 8)
         )
-        self.download_interval_combo = ttk.Combobox(
+        validate_download_interval = (
+            self.root.register(self.download_interval_eingabe_gueltig),
+            "%P",
+        )
+        self.download_interval_entry = ttk.Entry(
             options,
             textvariable=self.download_interval_var,
-            values=("60 Sekunden", "90 Sekunden", "2 Minuten", "5 Minuten", "10 Minuten"),
-            state="readonly",
+            validate="key",
+            validatecommand=validate_download_interval,
             width=16,
         )
-        self.download_interval_combo.grid(row=0, column=1, sticky="w")
-        self.download_interval_combo.bind(
-            "<<ComboboxSelected>>", self.download_einstellungen_aktualisieren
+        self.download_interval_entry.grid(row=0, column=1, sticky="w")
+        self.download_interval_var.trace_add(
+            "write", self.download_einstellungen_aktualisieren
+        )
+        self.download_interval_entry.bind(
+            "<FocusOut>", self.download_einstellungen_aktualisieren
+        )
+        self.download_interval_entry.bind(
+            "<Return>", self.download_einstellungen_aktualisieren
         )
 
         ttk.Label(options, text="Maximale Laufzeit:").grid(
@@ -5287,6 +5336,32 @@ class CudyGUI:
             justify="left",
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        self.download_speed_estimate_button = ttk.Button(
+            options,
+            text="1-GB-Zeit messen und Intervall setzen",
+            command=self.download_speed_intervall_messen,
+        )
+        self.download_speed_estimate_button.grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(12, 0)
+        )
+        ttk.Label(
+            options,
+            textvariable=self.download_speed_estimate_var,
+            wraplength=820,
+            justify="left",
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(
+            options,
+            text=(
+                "Die Messung lädt etwa 8 MB Testdaten herunter, nicht 1 GB, "
+                "und ändert keine LTE-Bänder. Der Intervallwert bleibt während "
+                "des Download-Modus bearbeitbar. Änderungen starten den Countdown "
+                "mit dem neuen Intervall neu; ein laufender SMS-Versand bleibt davon unberührt."
+            ),
+            wraplength=820,
+            justify="left",
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         self.download_size_var.trace_add(
             "write", self.download_groesse_vorschlag_aktualisieren
         )
@@ -5313,8 +5388,10 @@ class CudyGUI:
             tab,
             text=(
                 "Proaktive Refill-SMS sind standardmäßig ausgeschaltet. "
-                "Die App bestätigt nur, dass die SMS in der Router-Outbox erscheint; "
-                "sie kann die tatsächliche Freischaltung des Datenvolumens nicht bestätigen."
+                "Beim proaktiven Versand wird geprüft, ob der Router die SMS-Anfrage "
+                "angenommen hat; die Outbox wird dafür nicht abgewartet. Ob der "
+                "Mobilfunkanbieter das Datenvolumen tatsächlich freischaltet, kann "
+                "die App nicht bestätigen."
             ),
             wraplength=820,
             justify="left",
@@ -6996,42 +7073,42 @@ class CudyGUI:
 
         if aktuell_aktiv:
             with DOWNLOAD_MODE_LOCK:
+                laeuft_refill = DOWNLOAD_PROACTIVE_IN_PROGRESS
                 DOWNLOAD_MODE_ACTIVE = False
                 DOWNLOAD_PROACTIVE_ENABLED = False
                 DOWNLOAD_PROACTIVE_STARTED_AT = None
                 DOWNLOAD_PROACTIVE_NEXT_AT = None
-                DOWNLOAD_PROACTIVE_ATTEMPTS = 0
-                DOWNLOAD_PROACTIVE_BLOCKED = False
+                if not laeuft_refill:
+                    DOWNLOAD_PROACTIVE_ATTEMPTS = 0
+                    DOWNLOAD_PROACTIVE_BLOCKED = False
                 DOWNLOAD_MODE_STARTED_AT = None
                 DOWNLOAD_PROACTIVE_LAST_RESULT = (
                     "Download-Modus ausgeschaltet; normale Laufzeitwerte gelten wieder."
                     if not laeuft_refill
-                    else "Download-Modus ausgeschaltet; der laufende Versand wird noch abgeschlossen."
+                    else "Download-Modus ausgeschaltet; eine bereits gestartete SMS-Übermittlung läuft noch."
                 )
             self.download_proactive_var.set(False)
             print("Download-Modus ausgeschaltet; normale Laufzeitwerte gelten wieder.")
             return
 
-        if laeuft_refill:
-            messagebox.showinfo(
-                "Refill wird noch geprüft",
-                "Ein Refill-Zyklus wird noch auf die Outbox-Bestätigung geprüft. "
-                "Schalte den Download-Modus wieder ein, sobald dieser Vorgang beendet ist.",
-                parent=self.root,
-            )
-            return
-
         with DOWNLOAD_MODE_LOCK:
+            laeuft_refill = DOWNLOAD_PROACTIVE_IN_PROGRESS
             DOWNLOAD_MODE_ACTIVE = True
             DOWNLOAD_MODE_STARTED_AT = time.monotonic()
             DOWNLOAD_PROACTIVE_ENABLED = False
             DOWNLOAD_PROACTIVE_STARTED_AT = None
             DOWNLOAD_PROACTIVE_NEXT_AT = None
-            DOWNLOAD_PROACTIVE_ATTEMPTS = 0
-            DOWNLOAD_PROACTIVE_BLOCKED = False
-            DOWNLOAD_PROACTIVE_LAST_RESULT = (
-                "Proaktive Refill-SMS sind aus. Inbox-Trigger bleiben aktiv."
-            )
+            if not laeuft_refill:
+                DOWNLOAD_PROACTIVE_ATTEMPTS = 0
+                DOWNLOAD_PROACTIVE_BLOCKED = False
+                DOWNLOAD_PROACTIVE_LAST_RESULT = (
+                    "Proaktive Refill-SMS sind aus. Inbox-Trigger bleiben aktiv."
+                )
+            else:
+                DOWNLOAD_PROACTIVE_LAST_RESULT = (
+                    "Download-Modus aktiv. Eine vorher gestartete SMS-Übermittlung "
+                    "läuft noch; ein weiterer proaktiver Versand beginnt erst danach."
+                )
         self.download_proactive_var.set(False)
         print(
             "Download-Modus eingeschaltet: Poll 5s, Session-Refresh 60s, "
@@ -7055,8 +7132,9 @@ class CudyGUI:
             DOWNLOAD_PROACTIVE_ENABLED = False
             DOWNLOAD_PROACTIVE_STARTED_AT = None
             DOWNLOAD_PROACTIVE_NEXT_AT = None
-            DOWNLOAD_PROACTIVE_ATTEMPTS = 0
-            DOWNLOAD_PROACTIVE_BLOCKED = False
+            if not laeuft_refill:
+                DOWNLOAD_PROACTIVE_ATTEMPTS = 0
+                DOWNLOAD_PROACTIVE_BLOCKED = False
             DOWNLOAD_PROACTIVE_LAST_RESULT = (
                 f"{grund}; der laufende SMS-Versand wird noch abgeschlossen."
                 if laeuft_refill
@@ -7106,6 +7184,96 @@ class CudyGUI:
         self.download_max_refills_var.set(str(anzahl))
         self.download_einstellungen_aktualisieren()
 
+    def download_speed_intervall_messen(self):
+        if self._download_speedtest_running:
+            return
+
+        self._download_speedtest_running = True
+        self.download_speed_estimate_button.config(state="disabled")
+        self.download_speed_estimate_var.set(
+            "Internetgeschwindigkeit wird gemessen; dabei werden etwa 8 MB Testdaten geladen..."
+        )
+
+        def finish(result=None, error=None, simulated=False):
+            self._download_speedtest_running = False
+            self.download_speed_estimate_button.config(state="normal")
+            if error:
+                self.download_speed_estimate_var.set(
+                    "Messung fehlgeschlagen: " + error
+                )
+                return
+
+            try:
+                speed_mbps = float(result["download_mbps"])
+                if (
+                    not speed_mbps
+                    or speed_mbps <= 0
+                    or not Decimal(str(speed_mbps)).is_finite()
+                ):
+                    raise ValueError("Ungültiger Messwert")
+            except (KeyError, TypeError, ValueError):
+                self.download_speed_estimate_var.set(
+                    "Messung lieferte keinen verwertbaren Downloadwert."
+                )
+                return
+
+            one_gb_seconds = 8000.0 / speed_mbps
+            safe_seconds = one_gb_seconds * 0.8
+            max_seconds = 12 * 60 * 60
+            capped = safe_seconds > max_seconds
+            below_minimum = safe_seconds < 60
+            chosen_seconds = min(max_seconds, max(60, safe_seconds))
+            # The entry uses tenths of a minute, i.e. six-second intervals.
+            chosen_tenths = max(10, int(chosen_seconds // 6))
+            interval_text = f"{chosen_tenths // 10},{chosen_tenths % 10}"
+            self.download_interval_var.set(interval_text)
+            self.download_einstellungen_aktualisieren()
+
+            hours, remainder = divmod(int(one_gb_seconds + 0.5), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            duration_text = (
+                f"{hours} Std. {minutes} Min. {seconds} Sek."
+                if hours
+                else f"{minutes} Min. {seconds} Sek."
+            )
+            qualifier = "Simulierte Messung: " if simulated else ""
+            note = ""
+            if below_minimum:
+                note = " Die Sicherheitsgrenze beträgt mindestens 1 Minute."
+            elif capped:
+                note = " Das Intervall wurde auf 12 Stunden begrenzt."
+            self.download_speed_estimate_var.set(
+                f"{qualifier}{speed_mbps:.1f} Mbit/s; 1 GB dauert ungefähr "
+                f"{duration_text}. Das Intervall wurde mit 20 % Puffer auf "
+                f"{interval_text} Minuten gesetzt.{note}"
+            )
+
+        def worker():
+            try:
+                if FIRST_START_TEST_MODE:
+                    result = {"download_mbps": 20.0}
+                    simulated = True
+                else:
+                    result = measure_current_download_speed()
+                    simulated = False
+                self.root.after(
+                    0,
+                    lambda result=result, simulated=simulated: finish(
+                        result=result, simulated=simulated
+                    ),
+                )
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    self.root.after(0, lambda error=error: finish(error=error))
+                except tk.TclError:
+                    pass
+
+        try:
+            starte_hintergrund_thread(worker, name="cudy-download-speed-estimate")
+        except Exception as exc:
+            finish(error=str(exc))
+
     def download_zeitabschaetzung_aktualisieren(self, *_args):
         try:
             anzahl = parse_natural_refill_count(
@@ -7118,13 +7286,6 @@ class CudyGUI:
             )
             return
 
-        intervalle = {
-            "60 Sekunden": 60,
-            "90 Sekunden": 90,
-            "2 Minuten": 120,
-            "5 Minuten": 300,
-            "10 Minuten": 600,
-        }
         laufzeiten = {
             "1 Stunde": 1,
             "2 Stunden": 2,
@@ -7132,7 +7293,15 @@ class CudyGUI:
             "8 Stunden": 8,
             "12 Stunden": 12,
         }
-        intervall = intervalle.get(self.download_interval_var.get(), 60)
+        try:
+            intervall = parse_download_interval_seconds(
+                self.download_interval_var.get()
+            )
+        except ValueError:
+            self.download_time_estimate_var.set(
+                "Zeitabschätzung: Gib ein Mindestintervall zwischen 1 und 720 Minuten ein."
+            )
+            return
         laufzeit_stunden = laufzeiten.get(self.download_duration_var.get(), 12)
         minimum_sekunden = anzahl * intervall
         laufzeit_sekunden = laufzeit_stunden * 60 * 60
@@ -7160,24 +7329,17 @@ class CudyGUI:
             hinweis = (
                 f"Zeitabschätzung: {anzahl} Refill-SMS benötigen rechnerisch mindestens "
                 f"{mindestdauer} bei {intervall} Sekunden Mindestabstand; eingeplant "
-                f"sind {laufzeit_stunden} Stunden. Router-Bestätigungen und "
-                "Wartezeiten können die tatsächliche Dauer verlängern."
+                f"sind {laufzeit_stunden} Stunden. Router-Übertragung und "
+                "Anbieteraktivierung können länger dauern."
             )
         self.download_time_estimate_var.set(hinweis)
 
-    def download_einstellungen_aktualisieren(self, _event=None):
+    def download_einstellungen_aktualisieren(self, *_args):
         global DOWNLOAD_PROACTIVE_INTERVAL_SECONDS
         global DOWNLOAD_PROACTIVE_MAX_RUNTIME_SECONDS
         global DOWNLOAD_PROACTIVE_MAX_REFILLS
         global DOWNLOAD_PROACTIVE_NEXT_AT
 
-        intervalle = {
-            "60 Sekunden": 60,
-            "90 Sekunden": 90,
-            "2 Minuten": 120,
-            "5 Minuten": 300,
-            "10 Minuten": 600,
-        }
         laufzeiten = {
             "1 Stunde": 1,
             "2 Stunden": 2,
@@ -7192,11 +7354,16 @@ class CudyGUI:
             )
         except ValueError:
             maximum_refills = None
+        try:
+            interval_seconds = parse_download_interval_seconds(
+                self.download_interval_var.get()
+            )
+        except ValueError:
+            interval_seconds = None
 
         with DOWNLOAD_MODE_LOCK:
-            DOWNLOAD_PROACTIVE_INTERVAL_SECONDS = intervalle.get(
-                self.download_interval_var.get(), 60
-            )
+            if interval_seconds is not None:
+                DOWNLOAD_PROACTIVE_INTERVAL_SECONDS = interval_seconds
             DOWNLOAD_PROACTIVE_MAX_RUNTIME_SECONDS = (
                 laufzeiten.get(self.download_duration_var.get(), 12) * 60 * 60
             )
@@ -7242,7 +7409,7 @@ class CudyGUI:
                 DOWNLOAD_PROACTIVE_LAST_RESULT = (
                     "Proaktive Refill-Zyklen manuell ausgeschaltet."
                     if not DOWNLOAD_PROACTIVE_IN_PROGRESS
-                    else "Keine weiteren Zyklen; laufender Versand wird noch bestätigt."
+                    else "Keine weiteren Zyklen; der laufende Versand wird noch abgeschlossen."
                 )
             print("Download-Modus: proaktive Refill-Zyklen ausgeschaltet.")
             return
@@ -7272,31 +7439,39 @@ class CudyGUI:
             self.download_proactive_var.set(False)
             return
 
+        try:
+            interval = parse_download_interval_seconds(
+                self.download_interval_var.get()
+            )
+        except ValueError as exc:
+            messagebox.showwarning(
+                "Ungültiges Mindestintervall",
+                str(exc),
+                parent=self.root,
+            )
+            self.download_proactive_var.set(False)
+            return
+
         self.download_einstellungen_aktualisieren()
-        intervalle = {
-            "60 Sekunden": 60,
-            "90 Sekunden": 90,
-            "2 Minuten": 120,
-            "5 Minuten": 300,
-            "10 Minuten": 600,
-        }
-        interval = intervalle.get(self.download_interval_var.get(), 60)
         laufzeit = self.download_duration_var.get()
         maximum = parse_natural_refill_count(self.download_max_refills_var.get())
+        interval_minutes = Decimal(interval) / 60
+        interval_display = str(interval_minutes.quantize(Decimal("0.1"))).replace(".", ",")
         hinweis = (
             f"Die App darf ohne passenden Inbox-Trigger 'Refill' an 80808 senden.\n\n"
-            f"Mindestabstand: {self.download_interval_var.get()}\n"
+            f"Mindestabstand: {interval_display} Minuten\n"
             f"Maximale Laufzeit: {laufzeit}\n"
             f"Maximale Anzahl: {maximum} SMS\n"
             f"Die erste SMS wird frühestens nach {interval} Sekunden gesendet.\n\n"
-            "Die App prüft nach jedem Versand die Router-Outbox. Bei fehlender "
-            "Bestätigung pausiert sie weitere proaktive SMS. Möchtest du das ausdrücklich aktivieren?"
+            "Nach dem Versand prüft die App nur, ob der Router die Anfrage angenommen hat; "
+            "sie wartet bei proaktiven SMS nicht auf einen Outbox-Eintrag. Die tatsächliche "
+            "Freischaltung durch den Anbieter kann sie nicht bestätigen. "
+            "Möchtest du das ausdrücklich aktivieren?"
         )
         if blockiert:
             hinweis = (
-                "Der vorherige proaktive Refill wurde nicht bestätigt. Prüfe zuerst "
-                "die Router-Outbox; nur wenn du dort keinen ausstehenden Refill siehst, "
-                "solltest du fortfahren.\n\n" + hinweis
+                "Der vorherige proaktive Versand ist fehlgeschlagen. Prüfe zuerst "
+                "Router-Verbindung und Outbox, bevor du weitere SMS erlaubst.\n\n" + hinweis
             )
 
         if not messagebox.askyesno(
@@ -7347,6 +7522,7 @@ class CudyGUI:
             aktiv = DOWNLOAD_MODE_ACTIVE
             proaktiv = DOWNLOAD_PROACTIVE_ENABLED
             in_progress = DOWNLOAD_PROACTIVE_IN_PROGRESS
+            action_started = DOWNLOAD_PROACTIVE_ACTION_STARTED_AT
             blocked = DOWNLOAD_PROACTIVE_BLOCKED
             naechster = DOWNLOAD_PROACTIVE_NEXT_AT
             gestartet = DOWNLOAD_PROACTIVE_STARTED_AT
@@ -7382,19 +7558,32 @@ class CudyGUI:
                 "Aus: deine normalen Polling-, Refresh- und Watchdog-Werte gelten."
             )
 
-        if not proaktiv:
+        if in_progress:
+            elapsed = max(
+                0,
+                int(time.monotonic() - action_started),
+            ) if action_started is not None else 0
+            if elapsed >= 90:
+                self.download_next_cycle_var.set(
+                    f"Router-Übermittlung läuft seit {elapsed // 60} Min. "
+                    f"{elapsed % 60} Sek. (Zyklus {versuche}/{maximum}); "
+                    "es wird nicht auf die Outbox gewartet."
+                )
+            else:
+                self.download_next_cycle_var.set(
+                    f"SMS wird an den Router übermittelt ({versuche}/{maximum}, "
+                    f"{elapsed} Sek.); keine Outbox-Bestätigung erforderlich."
+                )
+        elif not proaktiv:
             self.download_next_cycle_var.set("Proaktive Refill-Zyklen sind ausgeschaltet.")
-        elif in_progress:
-            self.download_next_cycle_var.set(
-                f"Refill-Zyklus wird bestätigt ({versuche}/{maximum})."
-            )
         elif blocked:
             self.download_next_cycle_var.set(
                 "Automatisch pausiert, bis die vorherige Refill-Aktion geprüft wurde."
             )
         elif naechster is None:
             self.download_next_cycle_var.set(
-                f"Proaktive Zyklen aktiv ({versuche}/{maximum}); warte auf Outbox-Prüfung."
+                f"Proaktive Zyklen aktiv ({versuche}/{maximum}); eine andere Refill-Aktion "
+                "wartet noch auf ihre Bestätigung."
             )
         else:
             rest = max(0, int(naechster - time.monotonic() + 0.999))

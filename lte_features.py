@@ -286,6 +286,19 @@ def _measure(net, event):
     }
 
 
+def measure_current_download_speed():
+    """Measure the active internet connection without changing router bands."""
+    net = requests.Session()
+    net.headers["User-Agent"] = "CudyAutoRefill download interval estimate"
+    try:
+        result = _measure(net, None)
+        if result.get("download_mbps") is None:
+            raise RuntimeError("Die aktuelle Downloadgeschwindigkeit konnte nicht gemessen werden.")
+        return result
+    finally:
+        net.close()
+
+
 def run_all_band_speedtest(router_session, base_url, ensure_session, progress=None, cancel_event=None):
     original = read_band_config(router_session, base_url, ensure_session)
     bands = [b for b in LTE_BANDS if b in original["available"]] or list(original["available"])
