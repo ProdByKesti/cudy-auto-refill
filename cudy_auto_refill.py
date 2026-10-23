@@ -12,19 +12,24 @@ import logging
 import re
 import unicodedata
 import uuid
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 from lte_features import (
     LTE_BANDS,
+    BAND_TEST_MAX_REPEAT_COUNT,
     apply_band_config_with_fallback,
+    estimate_band_test_data_mb,
+    max_safe_band_test_runs,
     recover_offline_manual_band,
     read_band_config,
     run_all_band_speedtest,
     measure_current_download_speed,
+    summarize_band_history,
 )
 
 # ============================================================
@@ -77,6 +82,7 @@ SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
 # Keep one lock shared by normal and test launches to prevent duplicate polling.
 INSTANCE_LOCK_FILE = os.path.join(NORMAL_APP_DATA_DIR, "app.lock")
 MAX_GUI_LOG_LINES = 3000
+MAX_BAND_TEST_HISTORY_RUNS = 100
 
 _instance_lock_handle = None
 
@@ -395,6 +401,149 @@ def speichere_lte_profil(value):
         os.replace(temporary, LTE_PROFILE_FILE)
     except OSError as exc:
         print("LTE-Profil konnte nicht gespeichert werden:", exc)
+
+
+def formatiere_bandtest_historie(history, runs_to_show=None):
+    """Build the visible comparison and repeat-measurement recommendations."""
+    if not isinstance(history, list):
+        history = []
+    history = [run for run in history if isinstance(run, dict)]
+
+    def zeit_anzeigen(value):
+        try:
+            return datetime.fromisoformat(value).astimezone().strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+        except (TypeError, ValueError):
+            return str(value or "Zeit unbekannt")
+
+    def unsicherheit_anzeigen(stat, metric):
+        count = stat["usable_run_count"]
+        suffix = "mbps" if metric == "download" else "ms"
+        low = stat.get(f"{metric}_min_{suffix}")
+        high = stat.get(f"{metric}_max_{suffix}")
+        median = stat.get(f"{metric}_median_{suffix}")
+        if count < 2:
+            return "vorläufig; bisher nur ein gültiger Messlauf"
+        if low is None or high is None or median in (None, 0):
+            return f"{count} Messläufe; Streuung nicht bestimmbar"
+        spread = (high - low) / abs(median)
+        if spread >= 0.50:
+            level = "starke beobachtete Streuung"
+        elif spread >= 0.20:
+            level = "merkliche beobachtete Streuung"
+        else:
+            level = "geringe beobachtete Streuung"
+        return f"{level} über {count} Messläufe"
+
+    summary = summarize_band_history(history)
+    lines = [
+        f"Protokoll: {summary['run_count']} gespeicherte Messläufe. Empfehlungen "
+        f"berücksichtigen {summary['recommendation_run_count']} Läufe aus den letzten "
+        f"{summary['recommendation_window_days']} Tagen (höchstens "
+        f"{summary['recommendation_max_runs']}); nötig sind mindestens "
+        f"{summary['minimum_runs']} gültige Läufe je Band."
+    ]
+    if summary["ignored_run_count"]:
+        lines.append(
+            f"{summary['ignored_run_count']} ältere, undatierte oder über dem "
+            "Empfehlungslimit liegende Läufe bleiben im Protokoll, fließen aber "
+            "nicht in die Empfehlung ein."
+        )
+    if runs_to_show is None:
+        visible_runs = history[-MAX_BAND_TEST_HISTORY_RUNS:]
+        if visible_runs:
+            lines.append("\nMessprotokoll (gespeicherte Läufe):")
+    else:
+        visible_runs = [run for run in runs_to_show if isinstance(run, dict)]
+        if visible_runs:
+            lines.append(f"\nNeue Messläufe ({len(visible_runs)}):")
+    for run in visible_runs:
+        lines.append("\n" + zeit_anzeigen(run.get("measured_at")))
+        results = run.get("results", [])
+        if not isinstance(results, list):
+            continue
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            band = item.get("band", "?")
+            messzeit = zeit_anzeigen(item.get("measured_at"))
+            attempts = item.get("probe_attempts", 0)
+            failures = item.get("failed_probes", 0)
+            if item.get("download_mbps") is None or item.get("ping_ms") is None:
+                lines.append(
+                    f"  {messzeit} B{band}: "
+                    f"{item.get('status', 'keine vollständige Messung')}"
+                    f" | Fehlproben {failures}/{attempts}"
+                )
+                continue
+            jitter = item.get("jitter_ms")
+            jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
+            lines.append(
+                f"  {messzeit} B{band}: Download {item['download_mbps']:.1f} Mbit/s"
+                f" | Ping {item['ping_ms']:.0f} ms | Jitter {jitter_text}"
+                f" | Fehlproben {failures}/{attempts}"
+            )
+
+    if summary["recommendation_stable"]:
+        lines.append("\nEmpfehlungen aus wiederholten Messungen:")
+    else:
+        lines.append("\nVorläufige Empfehlungen:")
+        lines.append(
+            "Die bisherigen Messungen sind noch nicht aussagekräftig genug. "
+            f"Für eine bestätigte Empfehlung werden mindestens "
+            f"{summary['minimum_runs']} gültige Läufe je Band benötigt."
+        )
+    download_best = summary.get("download_best")
+    if download_best:
+        low = download_best["download_min_mbps"]
+        high = download_best["download_max_mbps"]
+        lines.append(
+            f"Download: B{download_best['band']} – Median "
+            f"{download_best['download_median_mbps']:.1f} Mbit/s "
+            f"(Spannweite {low:.1f}–{high:.1f}; "
+            f"{download_best['usable_run_count']} Läufe)."
+        )
+        lines.append(
+            "  Messunsicherheit: "
+            + unsicherheit_anzeigen(download_best, "download")
+            + "."
+        )
+    else:
+        lines.append(
+            "Download: noch keine Empfehlung; pro Band sind mindestens "
+            f"{summary['minimum_runs']} gültige Messläufe nötig."
+        )
+
+    latency_best = summary.get("latency_best")
+    if latency_best:
+        low = latency_best["ping_min_ms"]
+        high = latency_best["ping_max_ms"]
+        lines.append(
+            f"Gaming/Streaming: B{latency_best['band']} – Median Ping "
+            f"{latency_best['ping_median_ms']:.0f} ms "
+            f"(Spannweite {low:.0f}–{high:.0f} ms; "
+            f"{latency_best['usable_run_count']} Läufe), "
+            f"Fehlproben {latency_best['failed_probes']}/"
+            f"{latency_best['probe_attempts']}."
+        )
+        lines.append(
+            "  Messunsicherheit: "
+            + unsicherheit_anzeigen(latency_best, "ping")
+            + "."
+        )
+    else:
+        lines.append(
+            "Gaming/Streaming: noch keine Empfehlung; pro Band sind "
+            f"mindestens {summary['minimum_runs']} gültige Messläufe nötig."
+        )
+
+    lines.append(
+        "\nDu kannst eine Empfehlung übernehmen oder die Bänder manuell in "
+        "„LTE-Bänder verwalten“ einstellen. Bei fehlender Verbindung versucht "
+        "die App, die vorherige Bandwahl wiederherzustellen."
+    )
+    return lines
 
 
 # Polling
@@ -5520,8 +5669,10 @@ class CudyGUI:
         ttk.Label(
             band_frame,
             text=(
-                "Datenverbrauch: bis zu etwa 80 MB bei zehn Bändern "
-                "(zwei 4-MB-Downloads pro Band; Ping-Anfragen zusätzlich minimal)."
+                "Datenverbrauch: etwa 80 MB pro vollständigem Lauf über zehn Bänder. "
+                "Maximal zehn Läufe (geschätzt bis zu 800 MB); andere Downloads "
+                "im Haushalt sind darin nicht enthalten. Vor dem Test wird ein "
+                "Refill angefordert und die Aktivierung muss bestätigt werden."
             ),
             wraplength=800
         ).pack(anchor="w", pady=(6, 0))
@@ -5560,10 +5711,32 @@ class CudyGUI:
             wraplength=800
         ).pack(anchor="w", pady=(10, 0))
 
+        results_frame = ttk.Frame(band_frame)
+        results_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.band_speedtest_results = tk.Text(
-            band_frame, height=8, wrap="word", state="disabled"
+            results_frame, height=12, wrap="word", state="disabled"
         )
-        self.band_speedtest_results.pack(fill="x", pady=(8, 0))
+        results_scrollbar = ttk.Scrollbar(
+            results_frame,
+            orient="vertical",
+            command=self.band_speedtest_results.yview,
+        )
+        self.band_speedtest_results.configure(
+            yscrollcommand=results_scrollbar.set
+        )
+        self.band_speedtest_results.pack(side="left", fill="both", expand=True)
+        results_scrollbar.pack(side="right", fill="y")
+
+        history = lade_lte_profil().get("bandtest_historie", [])
+        if isinstance(history, list) and history:
+            self.band_speedtest_results.config(state="normal")
+            self.band_speedtest_results.insert(
+                "1.0", "\n".join(formatiere_bandtest_historie(history))
+            )
+            self.band_speedtest_results.config(state="disabled")
+            self.band_speedtest_status.set(
+                f"Gespeicherte Messhistorie geladen ({len(history)} Läufe)."
+            )
 
         ttk.Label(
             tab,
@@ -6704,7 +6877,7 @@ class CudyGUI:
         ):
             self.notebook.select(self.signal_tab)
             self.root.update_idletasks()
-            self.speedtest_alle_baender(bestaetigung=False)
+            self.speedtest_alle_baender()
 
     def speedtest_abbrechen(self):
         if self._band_test_cancel is not None:
@@ -6713,23 +6886,23 @@ class CudyGUI:
                 "Abbruch angefordert; die vorherige Bandwahl wird wiederhergestellt …"
             )
 
-    def speedtest_alle_baender(self, bestaetigung=True):
+    def speedtest_alle_baender(self, test_runs=None, refill_completed=False):
         if FIRST_START_TEST_MODE:
             self.band_speedtest_results.config(state="normal")
-            self.band_speedtest_results.delete("1.0", "end")
             self.band_speedtest_results.insert(
-                "1.0",
-                "SIMULIERTE ERGEBNISSE\n"
+                "end",
+                "\n\nSIMULIERTE ERGEBNISSE\n"
                 "Download: B28 (42,0 Mbit/s)\n"
                 "Gaming/Streaming: B3 (Ping 31 ms, Jitter 4 ms)\n\n"
                 "Beispielwerte – es wurde kein Router angesprochen und kein Testdatenvolumen geladen.",
             )
+            self.band_speedtest_results.see("end")
             self.band_speedtest_results.config(state="disabled")
             self.band_speedtest_status.set("LTE-Bandvergleich simuliert; keine Routeränderung.")
             print("Erststart-Test: LTE-Bandvergleich simuliert; kein Routerzugriff.")
             return
 
-        if self._band_test_running:
+        if self._band_test_running or getattr(self, "_band_test_refill_pending", False):
             return
         if programm_laeuft:
             messagebox.showinfo(
@@ -6739,15 +6912,125 @@ class CudyGUI:
                 parent=self.root
             )
             return
-        if bestaetigung and not messagebox.askyesno(
-            "Alle LTE-Bänder testen?",
-            "Der Test schaltet nacheinander jedes verfügbare LTE-Band ein. "
-            "Dabei wird die Verbindung mehrfach kurz getrennt.\n\n"
-            "Bei zehn Bändern werden bis zu etwa 80 MB Mobilfunkdaten "
-            "heruntergeladen. Die vorherige Bandwahl wird danach "
-            "wiederhergestellt.\n\nJetzt starten?",
-            parent=self.root
-        ):
+        max_test_runs = max_safe_band_test_runs(len(LTE_BANDS))
+        if max_test_runs < 1:
+            messagebox.showerror(
+                "LTE-Bandtest nicht verfügbar",
+                "Für die unterstützten LTE-Bänder kann kein Testlauf innerhalb "
+                "des 900-MB-Sicherheitsbudgets durchgeführt werden.",
+                parent=self.root,
+            )
+            return
+
+        refill_ready = getattr(self, "_band_test_refill_ready", False)
+        if refill_ready:
+            test_runs = getattr(self, "_band_test_prepared_runs", test_runs)
+            if not messagebox.askyesno(
+                "Refill vor dem Test bestätigen",
+                "Die Refill-SMS wurde vom Router angenommen. Ist die Bestätigung "
+                "von Lidl Connect angekommen und das zusätzliche Datenvolumen aktiv?\n\n"
+                "Der Router-Outbox-Eintrag allein bestätigt nur den SMS-Versand.",
+                parent=self.root,
+            ):
+                self.band_speedtest_status.set(
+                    "Bandtest wartet auf die Anbieterbestätigung des Refill-Volumens."
+                )
+                return
+            self._band_test_refill_ready = False
+            refill_completed = True
+
+        if test_runs is None:
+            test_runs = simpledialog.askinteger(
+                "Anzahl der Testläufe",
+                f"Wie viele vollständige LTE-Bandtests sollen nacheinander laufen? "
+                f"(1 bis {max_test_runs})\n\n"
+                f"Ein Lauf über {len(LTE_BANDS)} unterstützte Bänder benötigt "
+                f"geschätzt {estimate_band_test_data_mb(len(LTE_BANDS))} MB. "
+                f"Die Obergrenze hält die Testdaten unter 900 MB und lässt "
+                "Puffer bis 1 GB.",
+                initialvalue=min(2, max_test_runs),
+                minvalue=1,
+                maxvalue=max_test_runs,
+                parent=self.root,
+            )
+            if test_runs is None:
+                return
+
+        if not 1 <= test_runs <= max_test_runs:
+            messagebox.showerror(
+                "Ungültige Testanzahl",
+                f"Wähle zwischen 1 und {max_test_runs} vollständigen Testläufen.",
+                parent=self.root,
+            )
+            return
+
+        if not refill_completed:
+            estimated_mb = estimate_band_test_data_mb(len(LTE_BANDS), test_runs)
+            if not messagebox.askyesno(
+                "Refill vor dem LTE-Bandtest?",
+                f"Vor dem Test wird eine SMS mit '{REFILL_TEXT}' an "
+                f"{LIDL_ABSENDER} gesendet. Dadurch kann ein weiteres 1-GB-Refill "
+                "ausgelöst werden.\n\n"
+                f"Danach folgen {test_runs} vollständige Testläufe mit geschätzt "
+                f"bis zu {estimated_mb} MB Testdaten. Die Obergrenze liegt bei "
+                "900 MB, damit Puffer bis 1 GB bleibt.\n\n"
+                "Der Test startet erst, wenn du anschließend bestätigst, dass "
+                "Lidl Connect das zusätzliche Volumen aktiviert hat. Fortfahren?",
+                parent=self.root,
+            ):
+                return
+
+            self._band_test_refill_pending = True
+            self._band_test_prepared_runs = test_runs
+            self.band_speedtest_button.config(state="disabled")
+            self.start_button.config(state="disabled")
+            self.band_speedtest_status.set(
+                "Sende Vorab-Refill und prüfe die Router-Outbox …"
+            )
+
+            def refill_abgeschlossen(bestaetigt):
+                self._band_test_refill_pending = False
+                if not programm_laeuft:
+                    self.start_button.config(state="normal")
+                if not bestaetigt:
+                    self.band_speedtest_button.config(state="normal")
+                    self.band_speedtest_status.set(
+                        "Vorab-Refill nicht in der Outbox bestätigt; Bandtest nicht gestartet."
+                    )
+                    messagebox.showwarning(
+                        "Refill noch nicht bestätigt",
+                        "Die Router-Outbox hat den Vorab-Refill nicht bestätigt. "
+                        "Der LTE-Bandtest wurde deshalb nicht gestartet. Prüfe den "
+                        "Refill-Status, bevor du es erneut versuchst.",
+                        parent=self.root,
+                    )
+                    return
+
+                self._band_test_refill_ready = True
+                if messagebox.askyesno(
+                    "Datenvolumen prüfen",
+                    "Die Router-Outbox bestätigt, dass die Refill-SMS versendet "
+                    "wurde. Ist auch die Bestätigung von Lidl Connect angekommen "
+                    "und das zusätzliche Datenvolumen aktiv?\n\n"
+                    "Der Bandtest startet nur nach deiner Bestätigung.",
+                    parent=self.root,
+                ):
+                    self._band_test_refill_ready = False
+                    self.speedtest_alle_baender(
+                        test_runs=test_runs,
+                        refill_completed=True,
+                    )
+                else:
+                    self.band_speedtest_button.config(state="normal")
+                    self.band_speedtest_status.set(
+                        "Refill versendet; Bandtest wartet auf aktives Datenvolumen. "
+                        "Starte den Test erneut, sobald Lidl Connect es bestätigt hat."
+                    )
+
+            self.test_refill(
+                on_complete=refill_abgeschlossen,
+                ask_confirmation=False,
+            )
             return
 
         self._band_test_running = True
@@ -6755,9 +7038,15 @@ class CudyGUI:
         self.band_speedtest_button.config(state="disabled")
         self.start_button.config(state="disabled")
         self.band_speedtest_cancel_button.config(state="normal")
-        self.band_speedtest_status.set("Router-Bandeinstellungen werden gelesen …")
+        self.band_speedtest_status.set(
+            f"LTE-Bandvergleich läuft: {test_runs} Testlauf/-läufe werden ausgeführt …"
+        )
         self.band_speedtest_results.config(state="normal")
-        self.band_speedtest_results.delete("1.0", "end")
+        self.band_speedtest_results.insert(
+            "end",
+            f"\n\n=== Neuer Bandtest gestartet: {test_runs} Lauf/Läufe ===\n",
+        )
+        self.band_speedtest_results.see("end")
         self.band_speedtest_results.config(state="disabled")
 
         def progress(message):
@@ -6771,13 +7060,92 @@ class CudyGUI:
         def worker():
             outcome, error = None, None
             try:
+                initial_profile = lade_lte_profil()
+                initial_history = initial_profile.get("bandtest_historie", [])
+                if not isinstance(initial_history, list):
+                    initial_history = []
+                completed_for_display = []
+
+                def lauf_abgeschlossen(run, run_index, requested_runs):
+                    completed_for_display.append(run)
+                    summary = summarize_band_history(
+                        initial_history + completed_for_display
+                    )
+                    lines = [
+                        f"Zwischenauswertung nach Messlauf {run_index}/{requested_runs} "
+                        f"({summary['recommendation_run_count']} aktuelle Läufe in der Auswertung):"
+                    ]
+                    if summary["recommendation_stable"]:
+                        lines.append("Empfehlungen aus wiederholten Messungen:")
+                    else:
+                        lines.append("Vorläufige Empfehlungen:")
+                        lines.append(
+                            "Die bisherigen Messungen sind noch nicht aussagekräftig genug. "
+                            f"Mindestens {summary['minimum_runs']} gültige Läufe je Band "
+                            "sind für eine bestätigte Empfehlung nötig."
+                        )
+
+                    download_best = summary.get("download_best")
+                    if download_best:
+                        lines.append(
+                            f"Download: B{download_best['band']} – Median "
+                            f"{download_best['download_median_mbps']:.1f} Mbit/s "
+                            f"({download_best['usable_run_count']} Läufe)."
+                        )
+                    else:
+                        lines.append("Download: noch keine Empfehlung.")
+
+                    latency_best = summary.get("latency_best")
+                    if latency_best:
+                        lines.append(
+                            f"Gaming/Streaming: B{latency_best['band']} – Median Ping "
+                            f"{latency_best['ping_median_ms']:.0f} ms "
+                            f"({latency_best['usable_run_count']} Läufe)."
+                        )
+                    else:
+                        lines.append("Gaming/Streaming: noch keine Empfehlung.")
+
+                    def anhaengen(lines=lines):
+                        self.band_speedtest_results.config(state="normal")
+                        self.band_speedtest_results.insert(
+                            "end", "\n" + "\n".join(lines) + "\n"
+                        )
+                        self.band_speedtest_results.see("end")
+                        self.band_speedtest_results.config(state="disabled")
+
+                    try:
+                        self.root.after(0, anhaengen)
+                    except tk.TclError:
+                        pass
+
                 outcome = run_all_band_speedtest(
                     session, BASE_URL, router_session_sicherstellen,
                     progress=progress, cancel_event=self._band_test_cancel,
+                    repeat_count=test_runs,
+                    run_complete=lauf_abgeschlossen,
                 )
                 profile = lade_lte_profil()
-                profile["letzter_bandtest"] = outcome
+                history = profile.get("bandtest_historie", [])
+                if not isinstance(history, list):
+                    history = []
+                new_runs = outcome.get("runs", [])
+                history.extend(new_runs)
+                history = history[-MAX_BAND_TEST_HISTORY_RUNS:]
+                profile["bandtest_historie"] = history
+                profile["letzter_bandtest"] = {
+                    "started_at": outcome.get("started_at"),
+                    "completed_at": outcome.get("completed_at"),
+                    "requested_runs": outcome.get("requested_runs"),
+                    "completed_runs": outcome.get("completed_runs"),
+                    "results": outcome.get("results", []),
+                    "restored": outcome.get("restored"),
+                    "restore_error": outcome.get("restore_error"),
+                    "cancelled": outcome.get("cancelled"),
+                    "error": outcome.get("error"),
+                }
                 speichere_lte_profil(profile)
+                outcome["bandtest_historie"] = history
+                outcome["neue_bandtest_lauefe"] = new_runs
                 if outcome.get("restored"):
                     print("Vorherige LTE-Bandwahl wurde wiederhergestellt.")
                 else:
@@ -6797,41 +7165,143 @@ class CudyGUI:
                     self.start_button.config(state="normal")
                 self.band_speedtest_cancel_button.config(state="disabled")
                 if error:
+                    self.band_speedtest_results.config(state="normal")
+                    self.band_speedtest_results.insert(
+                        "end", f"\nBandvergleich fehlgeschlagen: {error}\n"
+                    )
+                    self.band_speedtest_results.see("end")
+                    self.band_speedtest_results.config(state="disabled")
                     self.band_speedtest_status.set("Bandvergleich fehlgeschlagen: " + error)
                     return
                 if not outcome:
                     self.band_speedtest_status.set("Keine Messergebnisse vorhanden.")
                     return
 
-                lines = []
-                for item in outcome["results"]:
-                    band = item["band"]
-                    if item.get("download_mbps") is None:
-                        lines.append(f"B{band}: {item.get('status', 'keine Messung')}")
-                        continue
-                    ping = item["ping_ms"]
-                    jitter = item.get("jitter_ms")
-                    jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
+                def zeit_anzeigen(value):
+                    try:
+                        return datetime.fromisoformat(value).astimezone().strftime(
+                            "%d.%m.%Y %H:%M:%S"
+                        )
+                    except (TypeError, ValueError):
+                        return str(value or "Zeit unbekannt")
+
+                def unsicherheit_anzeigen(stat, metric):
+                    count = stat["usable_run_count"]
+                    suffix = "mbps" if metric == "download" else "ms"
+                    low = stat.get(f"{metric}_min_{suffix}")
+                    high = stat.get(f"{metric}_max_{suffix}")
+                    median = stat.get(f"{metric}_median_{suffix}")
+                    if count < 2:
+                        return "vorläufig; bisher nur ein gültiger Messlauf"
+                    if low is None or high is None or median in (None, 0):
+                        return f"{count} Messläufe; Streuung nicht bestimmbar"
+                    spread = (high - low) / abs(median)
+                    if spread >= 0.50:
+                        level = "starke beobachtete Streuung"
+                    elif spread >= 0.20:
+                        level = "merkliche beobachtete Streuung"
+                    else:
+                        level = "geringe beobachtete Streuung"
+                    return f"{level} über {count} Messläufe"
+
+                history = outcome.get("bandtest_historie", [])
+                summary = summarize_band_history(history)
+                lines = [
+                    f"Protokoll: {summary['run_count']} gespeicherte Messläufe. Empfehlungen "
+                    f"berücksichtigen {summary['recommendation_run_count']} Läufe aus den letzten "
+                    f"{summary['recommendation_window_days']} Tagen (höchstens "
+                    f"{summary['recommendation_max_runs']}); nötig sind mindestens "
+                    f"{summary['minimum_runs']} gültige Läufe je Band."
+                ]
+                if summary["ignored_run_count"]:
                     lines.append(
-                        f"B{band}: Download {item['download_mbps']:.1f} Mbit/s"
-                        f" | Ping {ping:.0f} ms | Jitter {jitter_text}"
-                        f" | Fehlversuche {item.get('loss_percent', 0):.0f}%"
+                        f"{summary['ignored_run_count']} ältere, undatierte oder über dem "
+                        "Empfehlungslimit liegende Läufe bleiben im Protokoll, fließen aber "
+                        "nicht in die Empfehlung ein."
+                    )
+                recent_runs = outcome.get("neue_bandtest_lauefe", [])
+                if recent_runs:
+                    lines.append(f"\nNeue Messläufe ({len(recent_runs)}):")
+                for run in recent_runs:
+                    lines.append("\n" + zeit_anzeigen(run.get("measured_at")))
+                    for item in run.get("results", []):
+                        band = item.get("band", "?")
+                        messzeit = zeit_anzeigen(item.get("measured_at"))
+                        attempts = item.get("probe_attempts", 0)
+                        failures = item.get("failed_probes", 0)
+                        if item.get("download_mbps") is None or item.get("ping_ms") is None:
+                            lines.append(
+                                f"  {messzeit} B{band}: "
+                                f"{item.get('status', 'keine vollständige Messung')}"
+                                f" | Fehlproben {failures}/{attempts}"
+                            )
+                            continue
+                        jitter = item.get("jitter_ms")
+                        jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
+                        lines.append(
+                            f"  {messzeit} B{band}: Download {item['download_mbps']:.1f} Mbit/s"
+                            f" | Ping {item['ping_ms']:.0f} ms | Jitter {jitter_text}"
+                            f" | Fehlproben {failures}/{attempts}"
+                        )
+
+                if summary["recommendation_stable"]:
+                    lines.append("\nEmpfehlungen aus wiederholten Messungen:")
+                else:
+                    lines.append("\nVorläufige Empfehlungen:")
+                    lines.append(
+                        "Die bisherigen Messungen sind noch nicht aussagekräftig genug. "
+                        f"Für eine bestätigte Empfehlung werden mindestens "
+                        f"{summary['minimum_runs']} gültige Läufe je Band benötigt."
+                    )
+                download_best = summary.get("download_best")
+                if download_best:
+                    low = download_best["download_min_mbps"]
+                    high = download_best["download_max_mbps"]
+                    lines.append(
+                        f"Download: B{download_best['band']} – Median "
+                        f"{download_best['download_median_mbps']:.1f} Mbit/s "
+                        f"(Spannweite {low:.1f}–{high:.1f}; "
+                        f"{download_best['usable_run_count']} Läufe)."
+                    )
+                    lines.append(
+                        "  Messunsicherheit: "
+                        + unsicherheit_anzeigen(download_best, "download")
+                        + "."
+                    )
+                else:
+                    lines.append(
+                        "Download: noch keine Empfehlung; pro Band sind mindestens "
+                        f"{summary['minimum_runs']} gültige Messläufe nötig."
                     )
 
-                download_best = outcome.get("download_best")
-                gaming_best = outcome.get("gaming_best")
-                if download_best:
+                latency_best = summary.get("latency_best")
+                if latency_best:
+                    low = latency_best["ping_min_ms"]
+                    high = latency_best["ping_max_ms"]
                     lines.append(
-                        f"\nDownload-Empfehlung: B{download_best['band']} "
-                        f"({download_best['download_mbps']:.1f} Mbit/s)"
+                        f"Gaming/Streaming: B{latency_best['band']} – Median Ping "
+                        f"{latency_best['ping_median_ms']:.0f} ms "
+                        f"(Spannweite {low:.0f}–{high:.0f} ms; "
+                        f"{latency_best['usable_run_count']} Läufe), "
+                        f"Fehlproben {latency_best['failed_probes']}/"
+                        f"{latency_best['probe_attempts']}."
                     )
-                if gaming_best:
-                    jitter = gaming_best.get("jitter_ms")
-                    jitter_text = f"{jitter:.1f} ms" if jitter is not None else "n/a"
                     lines.append(
-                        f"Gaming/Streaming nach Latenz: B{gaming_best['band']} "
-                        f"(Ping {gaming_best['ping_ms']:.0f} ms, Jitter {jitter_text})"
+                        "  Messunsicherheit: "
+                        + unsicherheit_anzeigen(latency_best, "ping")
+                        + "."
                     )
+                else:
+                    lines.append(
+                        "Gaming/Streaming: noch keine Empfehlung; pro Band sind "
+                        f"mindestens {summary['minimum_runs']} gültige Messläufe nötig."
+                    )
+
+                lines.append(
+                    "\nDu kannst eine Empfehlung übernehmen oder die Bänder manuell in "
+                    "„LTE-Bänder verwalten“ einstellen. Bei fehlender Verbindung versucht "
+                    "die App, die vorherige Bandwahl wiederherzustellen."
+                )
                 if outcome.get("error"):
                     lines.append("\nTest vorzeitig beendet: " + outcome["error"])
                 if not outcome.get("restored"):
@@ -6841,7 +7311,8 @@ class CudyGUI:
                     )
 
                 self.band_speedtest_results.config(state="normal")
-                self.band_speedtest_results.insert("1.0", "\n".join(lines))
+                self.band_speedtest_results.insert("end", "\n".join(lines) + "\n")
+                self.band_speedtest_results.see("end")
                 self.band_speedtest_results.config(state="disabled")
                 self.band_speedtest_status.set(
                     "Test abgebrochen; Wiederherstellung wurde versucht."
@@ -6853,6 +7324,12 @@ class CudyGUI:
                     )
                 )
                 self.signal_aktualisieren()
+                if (
+                    not outcome.get("error")
+                    and not outcome.get("cancelled")
+                    and outcome.get("restored")
+                ):
+                    self.zeige_band_empfehlung(summary)
 
             try:
                 self.root.after(0, finish)
@@ -6860,6 +7337,217 @@ class CudyGUI:
                 pass
 
         starte_hintergrund_thread(worker, name="cudy-band-speedtest")
+
+    def zeige_band_empfehlung(self, summary):
+        download_best = summary.get("download_best")
+        latency_best = summary.get("latency_best")
+        dialog = tk.Toplevel(self.root)
+        dialog.title("LTE-Bandempfehlung")
+        dialog.geometry("560x390")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text="Welches Band möchtest du verwenden?",
+            font=("Segoe UI", 15, "bold"),
+        ).pack(anchor="w", padx=22, pady=(20, 8))
+
+        ttk.Label(
+            dialog,
+            text=(
+                f"Grundlage: {summary.get('recommendation_run_count', 0)} Messläufe "
+                f"aus den letzten {summary.get('recommendation_window_days', 14)} Tagen "
+                f"(maximal {summary.get('recommendation_max_runs', 20)})."
+            ),
+            wraplength=510,
+            justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 8))
+
+        if summary.get("recommendation_stable"):
+            hinweis = "Die Empfehlungen beruhen auf wiederholten Messungen."
+        else:
+            hinweis = (
+                "Die Empfehlungen sind vorläufig und noch nicht aussagekräftig genug. "
+                f"Mindestens {summary.get('minimum_runs', 2)} gültige Messläufe je Band "
+                "sind für eine bestätigte Empfehlung nötig."
+            )
+        ttk.Label(
+            dialog, text=hinweis, wraplength=510, justify="left"
+        ).pack(anchor="w", padx=22, pady=(0, 10))
+        ttk.Label(
+            dialog,
+            text=(
+                "Beim Übernehmen wird die LTE-Verbindung kurz getrennt. "
+                "Wenn sie nicht zurückkommt, versucht die App die vorherige "
+                "Bandwahl wiederherzustellen."
+            ),
+            wraplength=510,
+            justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 14))
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(
+            dialog, textvariable=status_var, wraplength=510, justify="left"
+        ).pack(anchor="w", padx=22, pady=(0, 8))
+
+        buttons_frame = ttk.Frame(dialog)
+        buttons_frame.pack(fill="x", padx=22, pady=(2, 20))
+        action_buttons = []
+        apply_state = {"running": False}
+
+        def close_dialog():
+            if not apply_state["running"] and dialog.winfo_exists():
+                dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        def apply_recommendation(best, purpose):
+            if not best:
+                return
+            if programm_laeuft or self._band_test_running:
+                messagebox.showinfo(
+                    "Bandwahl gerade nicht möglich",
+                    "Stoppe zuerst die SMS-Überwachung und laufende Bandtests.",
+                    parent=dialog,
+                )
+                return
+
+            band = str(best["band"])
+            apply_state["running"] = True
+            for button in action_buttons:
+                button.config(state="disabled")
+            self.start_button.config(state="disabled")
+            self.band_speedtest_button.config(state="disabled")
+            status_var.set(f"Band B{band} wird für {purpose} eingestellt …")
+
+            def worker():
+                def progress(message):
+                    try:
+                        self.root.after(
+                            0,
+                            lambda message=message: (
+                                status_var.set(message)
+                                if dialog.winfo_exists()
+                                else None
+                            ),
+                        )
+                    except tk.TclError:
+                        pass
+
+                try:
+                    outcome = apply_band_config_with_fallback(
+                        session,
+                        BASE_URL,
+                        router_session_sicherstellen,
+                        False,
+                        [band],
+                        progress=progress,
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    outcome = {"status": "failed", "error": str(exc)}
+
+                def finish_apply():
+                    apply_state["running"] = False
+                    if not programm_laeuft:
+                        self.start_button.config(state="normal")
+                    self.band_speedtest_button.config(state="normal")
+                    kind = outcome.get("status")
+                    if kind == "applied":
+                        self.band_speedtest_results.config(state="normal")
+                        self.band_speedtest_results.insert(
+                            "end",
+                            f"\nEmpfehlung übernommen: Band B{band} für {purpose}.\n",
+                        )
+                        self.band_speedtest_results.see("end")
+                        self.band_speedtest_results.config(state="disabled")
+                        self.band_speedtest_status.set(
+                            f"Empfohlenes Band B{band} für {purpose} eingestellt."
+                        )
+                        self.signal_aktualisieren()
+                        close_dialog()
+                    elif kind == "restored":
+                        status_var.set(
+                            "Mit dem empfohlenen Band kam keine Verbindung zustande. "
+                            "Die vorherige Bandwahl wurde wiederhergestellt."
+                        )
+                        messagebox.showwarning(
+                            "Bandwahl zurückgesetzt",
+                            str(outcome.get("error", "Die Bandwahl wurde zurückgesetzt.")),
+                            parent=dialog,
+                        )
+                        for button in action_buttons:
+                            button.config(state="normal")
+                    else:
+                        details = outcome.get("restore_error") or outcome.get("error")
+                        status_var.set(
+                            "Bandwahl konnte nicht bestätigt werden. Bitte prüfe die "
+                            "Verbindung und die aktuelle Auswahl im Router."
+                        )
+                        messagebox.showerror(
+                            "Bandwahl fehlgeschlagen",
+                            str(details or "Unbekannter Fehler beim Bandwechsel."),
+                            parent=dialog,
+                        )
+                        for button in action_buttons:
+                            button.config(state="normal")
+
+                try:
+                    self.root.after(0, finish_apply)
+                except tk.TclError:
+                    pass
+
+            starte_hintergrund_thread(worker, name="cudy-recommended-band")
+
+        download_button = ttk.Button(
+            buttons_frame,
+            text=(
+                f"Download: B{download_best['band']} verwenden"
+                if download_best
+                else "Download: keine Empfehlung verfügbar"
+            ),
+            command=lambda: apply_recommendation(download_best, "Download"),
+            state="normal" if download_best else "disabled",
+        )
+        download_button.pack(fill="x", pady=(0, 7))
+        action_buttons.append(download_button)
+
+        latency_button = ttk.Button(
+            buttons_frame,
+            text=(
+                f"Gaming/Streaming: B{latency_best['band']} verwenden"
+                if latency_best
+                else "Gaming/Streaming: keine Empfehlung verfügbar"
+            ),
+            command=lambda: apply_recommendation(latency_best, "Gaming/Streaming"),
+            state="normal" if latency_best else "disabled",
+        )
+        latency_button.pack(fill="x", pady=(0, 7))
+        action_buttons.append(latency_button)
+
+        def manual_selection():
+            if apply_state["running"]:
+                return
+            dialog.destroy()
+            self.notebook.select(self.signal_tab)
+            self.baender_verwalten()
+
+        manual_button = ttk.Button(
+            buttons_frame,
+            text="Manuell einstellen",
+            command=manual_selection,
+        )
+        manual_button.pack(fill="x", pady=(0, 7))
+        action_buttons.append(manual_button)
+
+        no_button = ttk.Button(
+            buttons_frame,
+            text="Nein",
+            command=close_dialog,
+        )
+        no_button.pack(fill="x")
+        action_buttons.append(no_button)
 
     # ========================================================
     # SIGNAL AKTUALISIEREN
@@ -6896,7 +7584,7 @@ class CudyGUI:
     # TEST REFILL
     # ========================================================
 
-    def test_refill(self):
+    def test_refill(self, on_complete=None, ask_confirmation=True):
         if FIRST_START_TEST_MODE:
             aktions_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
             log_refill_aktion(
@@ -6908,7 +7596,7 @@ class CudyGUI:
             print("Erststart-Test: Manueller Refill simuliert; keine SMS versendet.")
             return
 
-        if not messagebox.askyesno(
+        if ask_confirmation and not messagebox.askyesno(
             "Notfall-Refill senden?",
             f"Jetzt '{REFILL_TEXT}' per SMS an {LIDL_ABSENDER} senden?\n\n"
             "Dadurch kann beim Mobilfunkanbieter ein Refill ausgelöst werden.",
@@ -6932,6 +7620,7 @@ class CudyGUI:
             )
             print("Manueller Refill gestartet: sende 'Refill' an 80808.")
             versand_gestartet = False
+            refill_bestaetigt = False
             outbox_vorher = None
             lock_acquired = False
             try:
@@ -7025,6 +7714,7 @@ class CudyGUI:
                     if not warte_auf_outbox_bestaetigung(vorher, aktions_id):
                         print("Manueller Refill noch nicht bestätigt; die Outbox wird weiter geprüft.")
                         return
+                    refill_bestaetigt = True
 
                 print("Manueller Refill erfolgreich: neue Refill-SMS in der Outbox bestätigt.")
             except Exception as exc:
@@ -7051,7 +7741,12 @@ class CudyGUI:
                 if lock_acquired:
                     REFILL_SEND_LOCK.release()
                 try:
-                    self.root.after(0, lambda: self.test_refill_button.config(state="normal"))
+                    def abgeschlossen():
+                        self.test_refill_button.config(state="normal")
+                        if on_complete:
+                            on_complete(refill_bestaetigt)
+
+                    self.root.after(0, abgeschlossen)
                 except tk.TclError:
                     pass
 
