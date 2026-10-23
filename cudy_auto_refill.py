@@ -12,6 +12,7 @@ import logging
 import re
 import unicodedata
 import uuid
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import tkinter as tk
 from logging.handlers import RotatingFileHandler
 from tkinter import ttk, messagebox, filedialog
@@ -434,6 +435,38 @@ DOWNLOAD_PROACTIVE_LAST_ACTION_ID = None
 DOWNLOAD_PROACTIVE_CURRENT_ACTION_ID = None
 DOWNLOAD_LAST_REFILL_CONFIRMED_AT = None
 DOWNLOAD_MODE_LOCK = threading.RLock()
+
+
+def parse_natural_refill_count(value):
+    """Return a positive base-10 integer entered as the refill limit."""
+    value = str(value).strip()
+    if not value or not value.isascii() or not value.isdigit():
+        raise ValueError("Bitte eine natürliche Zahl größer als 0 eingeben.")
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise ValueError("Die eingegebene Zahl ist zu groß.") from exc
+    if count < 1:
+        raise ValueError("Bitte eine natürliche Zahl größer als 0 eingeben.")
+    return count
+
+
+def parse_download_size_gb(value):
+    """Parse a positive, optionally fractional download size in GB."""
+    normalized = str(value).strip().replace(",", ".")
+    try:
+        size = Decimal(normalized)
+    except InvalidOperation as exc:
+        raise ValueError("Bitte eine Downloadgröße größer als 0 eingeben.") from exc
+    if not size.is_finite() or size <= 0:
+        raise ValueError("Bitte eine Downloadgröße größer als 0 eingeben.")
+    return size
+
+
+def recommended_refill_count(download_size_gb):
+    """Round the download size up to whole GB and add one start-up buffer refill."""
+    size = parse_download_size_gb(download_size_gb)
+    return int(size.to_integral_value(rounding=ROUND_CEILING)) + 1
 
 
 def aktuelles_poll_intervall():
@@ -4185,18 +4218,18 @@ class CudyGUI:
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        window_width = min(1000, max(640, screen_width - 24))
-        window_height = min(720, max(480, screen_height - 40))
+        window_width = min(1120, max(640, screen_width - 40))
+        window_height = min(820, max(480, screen_height - 80))
         window_x = max(0, (screen_width - window_width) // 2)
-        window_y = 0
+        window_y = max(0, (screen_height - window_height) // 2)
 
         self.root.geometry(
             f"{window_width}x{window_height}+{window_x}+{window_y}"
         )
 
         self.root.minsize(
-            min(850, max(640, screen_width - 24)),
-            min(640, max(480, screen_height - 40))
+            min(900, window_width),
+            min(620, window_height)
         )
 
         self.root.protocol(
@@ -4226,6 +4259,11 @@ class CudyGUI:
         self.download_interval_var = tk.StringVar(value="60 Sekunden")
         self.download_duration_var = tk.StringVar(value="12 Stunden")
         self.download_max_refills_var = tk.StringVar(value="20")
+        self.download_size_var = tk.StringVar(value="")
+        self.download_size_suggestion_var = tk.StringVar(
+            value="Optional: Downloadgröße eintragen, um einen Refill-Vorschlag zu erhalten."
+        )
+        self.download_time_estimate_var = tk.StringVar(value="")
         self.download_proactive_var = tk.BooleanVar(value=False)
         self.download_mode_status_var = tk.StringVar(
             value="Download-Modus ist ausgeschaltet."
@@ -4234,6 +4272,9 @@ class CudyGUI:
         self.download_last_result_var = tk.StringVar(value="Noch kein Refill-Zyklus.")
 
         self.auto_follow = tk.BooleanVar(value=True)
+        self._scrollable_tab_canvases = {}
+        self._scrollable_tab_wraplengths = {}
+        self.root.bind_all("<MouseWheel>", self._scroll_tab_mousewheel, add="+")
 
         self.baue_gui()
 
@@ -4324,6 +4365,79 @@ class CudyGUI:
     # ========================================================
     # GUI AUFBAU
     # ========================================================
+
+    def _baue_scrollbaren_tab(self, tab, padding=15):
+        """Create responsive tab content with a vertical scrollbar."""
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(tab, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(canvas, padding=padding)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+        self._scrollable_tab_canvases[str(content)] = canvas
+
+        def aktualisiere_scrollbereich(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def aktualisiere_inhaltbreite(event):
+            canvas.itemconfigure(window_id, width=event.width)
+            verfuegbare_breite = max(220, event.width - padding * 2 - 24)
+
+            def passe_textumbruch_an(widget):
+                try:
+                    wraplength = int(widget.cget("wraplength"))
+                except (tk.TclError, TypeError, ValueError):
+                    wraplength = 0
+                if wraplength > 0:
+                    original = self._scrollable_tab_wraplengths.setdefault(
+                        str(widget), wraplength
+                    )
+                    ziel = min(original, verfuegbare_breite)
+                    try:
+                        if int(widget.cget("wraplength")) != ziel:
+                            widget.configure(wraplength=ziel)
+                    except (tk.TclError, TypeError, ValueError):
+                        pass
+                for child in widget.winfo_children():
+                    passe_textumbruch_an(child)
+
+            passe_textumbruch_an(content)
+
+        content.bind("<Configure>", aktualisiere_scrollbereich, add="+")
+        canvas.bind("<Configure>", aktualisiere_inhaltbreite, add="+")
+        return content
+
+    def _scroll_tab_mousewheel(self, event):
+        """Scroll the tab under the pointer without hijacking input widgets."""
+        if isinstance(event.widget, (ttk.Combobox, tk.Text, tk.Listbox, tk.Spinbox)):
+            return None
+
+        widget = event.widget
+        try:
+            while widget is not None:
+                canvas = self._scrollable_tab_canvases.get(str(widget))
+                if canvas is not None:
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    if not delta:
+                        return None
+                    units = int(-delta / 120)
+                    if units == 0:
+                        units = -1 if delta > 0 else 1
+                    canvas.yview_scroll(units, "units")
+                    return "break"
+
+                parent = widget.winfo_parent()
+                if not parent:
+                    break
+                widget = widget.nametowidget(parent)
+        except (tk.TclError, KeyError):
+            return None
+        return None
 
     def baue_gui(self):
 
@@ -4438,9 +4552,9 @@ class CudyGUI:
         # TAB 1 – ÜBERSICHT
         # ====================================================
 
-        self.uebersicht_tab = ttk.Frame(
-            self.notebook,
-            padding=15
+        self.uebersicht_tab = ttk.Frame(self.notebook)
+        self.uebersicht_inhalt = self._baue_scrollbaren_tab(
+            self.uebersicht_tab, padding=15
         )
 
         self.notebook.add(
@@ -4454,10 +4568,8 @@ class CudyGUI:
         # TAB 2 – SMS
         # ====================================================
 
-        self.sms_tab = ttk.Frame(
-            self.notebook,
-            padding=15
-        )
+        self.sms_tab = ttk.Frame(self.notebook)
+        self.sms_inhalt = self._baue_scrollbaren_tab(self.sms_tab, padding=15)
 
         self.notebook.add(
             self.sms_tab,
@@ -4470,9 +4582,9 @@ class CudyGUI:
         # TAB 3 – REFILL
         # ====================================================
 
-        self.refill_tab = ttk.Frame(
-            self.notebook,
-            padding=15
+        self.refill_tab = ttk.Frame(self.notebook)
+        self.refill_inhalt = self._baue_scrollbaren_tab(
+            self.refill_tab, padding=15
         )
 
         self.notebook.add(
@@ -4486,9 +4598,9 @@ class CudyGUI:
         # TAB 4 – DOWNLOAD
         # ====================================================
 
-        self.download_tab = ttk.Frame(
-            self.notebook,
-            padding=15
+        self.download_tab = ttk.Frame(self.notebook)
+        self.download_inhalt = self._baue_scrollbaren_tab(
+            self.download_tab, padding=15
         )
 
         self.notebook.add(
@@ -4502,9 +4614,9 @@ class CudyGUI:
         # TAB 5 – SIGNAL
         # ====================================================
 
-        self.signal_tab = ttk.Frame(
-            self.notebook,
-            padding=15
+        self.signal_tab = ttk.Frame(self.notebook)
+        self.signal_inhalt = self._baue_scrollbaren_tab(
+            self.signal_tab, padding=15
         )
 
         self.notebook.add(
@@ -4518,9 +4630,9 @@ class CudyGUI:
         # TAB 6 – EINSTELLUNGEN
         # ====================================================
 
-        self.einstellungen_tab = ttk.Frame(
-            self.notebook,
-            padding=15
+        self.einstellungen_tab = ttk.Frame(self.notebook)
+        self.einstellungen_inhalt = self._baue_scrollbaren_tab(
+            self.einstellungen_tab, padding=15
         )
 
         self.notebook.add(
@@ -4552,7 +4664,7 @@ class CudyGUI:
 
     def baue_uebersicht(self):
 
-        tab = self.uebersicht_tab
+        tab = self.uebersicht_inhalt
 
         # ----------------------------------------------------
         # INFO
@@ -4687,7 +4799,7 @@ class CudyGUI:
 
     def baue_sms_tab(self):
 
-        tab = self.sms_tab
+        tab = self.sms_inhalt
 
         ttk.Label(
             tab,
@@ -4848,7 +4960,7 @@ class CudyGUI:
 
     def baue_refill_tab(self):
 
-        tab = self.refill_tab
+        tab = self.refill_inhalt
 
         ttk.Label(
             tab,
@@ -5003,8 +5115,12 @@ class CudyGUI:
             pady=(20, 0)
         )
 
+    @staticmethod
+    def download_max_refills_eingabe_gueltig(value):
+        return not value or (value.isascii() and value.isdigit())
+
     def baue_download_tab(self):
-        tab = self.download_tab
+        tab = self.download_inhalt
 
         ttk.Label(
             tab,
@@ -5101,17 +5217,84 @@ class CudyGUI:
         ttk.Label(options, text="Maximale Refill-SMS:").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
-        self.download_max_refills_combo = ttk.Combobox(
+        validate_natural_number = (
+            self.root.register(self.download_max_refills_eingabe_gueltig),
+            "%P",
+        )
+        self.download_max_refills_entry = ttk.Entry(
             options,
             textvariable=self.download_max_refills_var,
-            values=("1", "2", "5", "10", "20", "40"),
-            state="readonly",
             width=16,
+            validate="key",
+            validatecommand=validate_natural_number,
         )
-        self.download_max_refills_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
-        self.download_max_refills_combo.bind(
-            "<<ComboboxSelected>>", self.download_einstellungen_aktualisieren
+        self.download_max_refills_entry.grid(
+            row=2, column=1, sticky="w", pady=(8, 0)
         )
+        self.download_max_refills_entry.bind(
+            "<FocusOut>", self.download_einstellungen_aktualisieren
+        )
+        self.download_max_refills_entry.bind(
+            "<Return>", self.download_einstellungen_aktualisieren
+        )
+        ttk.Label(
+            options,
+            text=(
+                "Ein bestätigter Refill schaltet 1 GB frei. Richtwert: Bei einem "
+                "52-GB-Download z. B. 53 Refill-SMS einplanen, damit ein fehlendes "
+                "Startguthaben von 1 GB berücksichtigt ist."
+            ),
+            wraplength=420,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(options, text="Downloadgröße (GB):").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=(10, 0)
+        )
+        validate_download_size = (
+            self.root.register(self.download_groesse_eingabe_gueltig),
+            "%P",
+        )
+        self.download_size_entry = ttk.Entry(
+            options,
+            textvariable=self.download_size_var,
+            width=16,
+            validate="key",
+            validatecommand=validate_download_size,
+        )
+        self.download_size_entry.grid(
+            row=4, column=1, sticky="w", pady=(10, 0)
+        )
+        self.download_size_suggestion_button = ttk.Button(
+            options,
+            text="Vorschlag übernehmen",
+            command=self.download_refill_vorschlag_uebernehmen,
+            state="disabled",
+        )
+        self.download_size_suggestion_button.grid(
+            row=4, column=2, sticky="w", padx=(8, 0), pady=(10, 0)
+        )
+        ttk.Label(
+            options,
+            textvariable=self.download_size_suggestion_var,
+            wraplength=820,
+            justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(
+            options,
+            textvariable=self.download_time_estimate_var,
+            wraplength=820,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        self.download_size_var.trace_add(
+            "write", self.download_groesse_vorschlag_aktualisieren
+        )
+        self.download_max_refills_var.trace_add(
+            "write", self.download_zeitabschaetzung_aktualisieren
+        )
+        self.download_groesse_vorschlag_aktualisieren()
+        self.download_zeitabschaetzung_aktualisieren()
 
         status_frame = ttk.LabelFrame(tab, text="Status", padding=15)
         status_frame.pack(fill="x", pady=(15, 0))
@@ -5143,7 +5326,7 @@ class CudyGUI:
 
     def baue_signal_tab(self):
 
-        tab = self.signal_tab
+        tab = self.signal_inhalt
 
         ttk.Label(
             tab,
@@ -5320,7 +5503,7 @@ class CudyGUI:
 
     def baue_einstellungen_tab(self):
 
-        tab = self.einstellungen_tab
+        tab = self.einstellungen_inhalt
 
         ttk.Label(
             tab,
@@ -6882,6 +7065,106 @@ class CudyGUI:
         self.download_proactive_var.set(False)
         print("Download-Modus beendet:", grund)
 
+    @staticmethod
+    def download_groesse_eingabe_gueltig(value):
+        return (
+            len(value) <= 24
+            and re.fullmatch(r"[0-9]*(?:[.,][0-9]*)?", value) is not None
+        )
+
+    def download_groesse_vorschlag_aktualisieren(self, *_args):
+        try:
+            anzahl = recommended_refill_count(self.download_size_var.get())
+        except ValueError:
+            value = self.download_size_var.get().strip()
+            self.download_size_suggestion_button.config(state="disabled")
+            self.download_size_suggestion_var.set(
+                "Gib eine Downloadgröße größer als 0 ein, zum Beispiel 52 oder 52,5 GB."
+                if value
+                else "Optional: Downloadgröße eintragen, um einen Refill-Vorschlag zu erhalten."
+            )
+            return
+
+        self.download_size_suggestion_button.config(state="normal")
+        self.download_size_suggestion_var.set(
+            f"Vorschlag: {anzahl} Refill-SMS (Downloadgröße auf ganze GB aufgerundet "
+            "plus 1 Refill als Startpuffer). Der Vorschlag wird erst mit dem Button "
+            "übernommen und kann danach manuell geändert werden."
+        )
+
+    def download_refill_vorschlag_uebernehmen(self):
+        try:
+            anzahl = recommended_refill_count(self.download_size_var.get())
+        except ValueError as exc:
+            messagebox.showwarning(
+                "Downloadgröße fehlt",
+                str(exc),
+                parent=self.root,
+            )
+            return
+
+        self.download_max_refills_var.set(str(anzahl))
+        self.download_einstellungen_aktualisieren()
+
+    def download_zeitabschaetzung_aktualisieren(self, *_args):
+        try:
+            anzahl = parse_natural_refill_count(
+                self.download_max_refills_var.get()
+            )
+        except ValueError:
+            self.download_time_estimate_var.set(
+                "Zeitabschätzung: Gib zuerst eine natürliche Zahl größer als 0 "
+                "bei „Maximale Refill-SMS“ ein."
+            )
+            return
+
+        intervalle = {
+            "60 Sekunden": 60,
+            "90 Sekunden": 90,
+            "2 Minuten": 120,
+            "5 Minuten": 300,
+            "10 Minuten": 600,
+        }
+        laufzeiten = {
+            "1 Stunde": 1,
+            "2 Stunden": 2,
+            "4 Stunden": 4,
+            "8 Stunden": 8,
+            "12 Stunden": 12,
+        }
+        intervall = intervalle.get(self.download_interval_var.get(), 60)
+        laufzeit_stunden = laufzeiten.get(self.download_duration_var.get(), 12)
+        minimum_sekunden = anzahl * intervall
+        laufzeit_sekunden = laufzeit_stunden * 60 * 60
+
+        minuten = (minimum_sekunden + 59) // 60
+        stunden, rest_minuten = divmod(minuten, 60)
+        if stunden:
+            mindestdauer = f"{stunden} Std. {rest_minuten} Min."
+        else:
+            mindestdauer = f"{rest_minuten} Min."
+
+        if minimum_sekunden > laufzeit_sekunden:
+            hinweis = (
+                f"Achtung: {anzahl} Refill-SMS benötigen bei {intervall} Sekunden "
+                f"Abstand rechnerisch mindestens {mindestdauer}; die gewählte "
+                f"Laufzeit beträgt nur {laufzeit_stunden} Stunden."
+            )
+        elif minimum_sekunden >= laufzeit_sekunden * 0.8:
+            hinweis = (
+                f"Zeitplan knapp: mindestens {mindestdauer} für {anzahl} Refill-SMS "
+                f"bei {intervall} Sekunden Abstand; nur {laufzeit_stunden} Stunden "
+                "Laufzeit eingeplant."
+            )
+        else:
+            hinweis = (
+                f"Zeitabschätzung: {anzahl} Refill-SMS benötigen rechnerisch mindestens "
+                f"{mindestdauer} bei {intervall} Sekunden Mindestabstand; eingeplant "
+                f"sind {laufzeit_stunden} Stunden. Router-Bestätigungen und "
+                "Wartezeiten können die tatsächliche Dauer verlängern."
+            )
+        self.download_time_estimate_var.set(hinweis)
+
     def download_einstellungen_aktualisieren(self, _event=None):
         global DOWNLOAD_PROACTIVE_INTERVAL_SECONDS
         global DOWNLOAD_PROACTIVE_MAX_RUNTIME_SECONDS
@@ -6903,6 +7186,13 @@ class CudyGUI:
             "12 Stunden": 12,
         }
 
+        try:
+            maximum_refills = parse_natural_refill_count(
+                self.download_max_refills_var.get()
+            )
+        except ValueError:
+            maximum_refills = None
+
         with DOWNLOAD_MODE_LOCK:
             DOWNLOAD_PROACTIVE_INTERVAL_SECONDS = intervalle.get(
                 self.download_interval_var.get(), 60
@@ -6910,10 +7200,8 @@ class CudyGUI:
             DOWNLOAD_PROACTIVE_MAX_RUNTIME_SECONDS = (
                 laufzeiten.get(self.download_duration_var.get(), 12) * 60 * 60
             )
-            DOWNLOAD_PROACTIVE_MAX_REFILLS = max(
-                1,
-                min(40, int(self.download_max_refills_var.get() or "20")),
-            )
+            if maximum_refills is not None:
+                DOWNLOAD_PROACTIVE_MAX_REFILLS = maximum_refills
             if (
                 DOWNLOAD_MODE_ACTIVE
                 and DOWNLOAD_PROACTIVE_ENABLED
@@ -6925,6 +7213,7 @@ class CudyGUI:
                 )
 
         aktualisiere_download_laufzeitlimit()
+        self.download_zeitabschaetzung_aktualisieren()
 
     def download_proaktiv_umschalten(self):
         global DOWNLOAD_PROACTIVE_ENABLED
@@ -6934,6 +7223,18 @@ class CudyGUI:
         global DOWNLOAD_PROACTIVE_LAST_RESULT
 
         aktivieren = self.download_proactive_var.get()
+        if aktivieren:
+            try:
+                parse_natural_refill_count(self.download_max_refills_var.get())
+            except ValueError as exc:
+                messagebox.showwarning(
+                    "Ungültige maximale Refill-Anzahl",
+                    str(exc),
+                    parent=self.root,
+                )
+                self.download_proactive_var.set(False)
+                return
+
         if not aktivieren:
             with DOWNLOAD_MODE_LOCK:
                 DOWNLOAD_PROACTIVE_ENABLED = False
@@ -6981,7 +7282,7 @@ class CudyGUI:
         }
         interval = intervalle.get(self.download_interval_var.get(), 60)
         laufzeit = self.download_duration_var.get()
-        maximum = int(self.download_max_refills_var.get() or "20")
+        maximum = parse_natural_refill_count(self.download_max_refills_var.get())
         hinweis = (
             f"Die App darf ohne passenden Inbox-Trigger 'Refill' an 80808 senden.\n\n"
             f"Mindestabstand: {self.download_interval_var.get()}\n"
