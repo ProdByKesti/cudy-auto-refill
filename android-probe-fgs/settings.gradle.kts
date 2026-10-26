@@ -4,6 +4,13 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "com.android.library") {
+                useModule("com.android.tools.build:gradle:${requested.version}")
+            }
+        }
+    }
 }
 plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "0.10.0"
@@ -17,5 +24,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "CudyForegroundProbe"
-include(":app")
+rootProject.name = "CudyAndroid"
+include(":app", ":security-gate", ":cudy-app")

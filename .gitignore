@@ -15,6 +15,10 @@ sms_state.json*
 *.log.*
 .vscode/
 
+# Android Studio and Gradle output for the Android modules.
+android-probe-fgs/.gradle/
+android-probe-fgs/**/build/
+
 # This folder contains several downloaded variants; publish only the selected baseline.
 /main*.py
 !/main_settings_only_fixed2.py

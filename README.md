@@ -26,6 +26,10 @@ A small Python/Tkinter desktop tool for a Cudy LT300 V3 LTE router. It monitors 
 - First-run prompt recommends replacing the factory router password and verifies the password entered for the app
 - Settings can be exported and restored as a versioned JSON file; only the router address and monitoring intervals are included
 
+## Android app in development
+
+The separate Android work is in `android-probe-fgs`. It contains `:cudy-app` for the router UI, `:security-gate` for Android system authentication, and `:app` as a read-only background-connection probe. In Android Studio, open `android-probe-fgs` and choose the `cudy-app` run configuration to launch the router app; `app` still launches the probe. The current Android app has protected manual refill, router-password change, and LTE-band selection. Background monitoring and automatic refill are not implemented in Android yet, so the Python desktop app remains the complete version.
+
 ## Requirements
 
 - Python 3
